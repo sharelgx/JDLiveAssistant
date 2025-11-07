@@ -9,7 +9,13 @@ import sys
 
 from loguru import logger
 
-from JD_Live_Assistant.core import BrowserController, ConfigManager, HotkeyManager, ScheduleManager
+from JD_Live_Assistant.core import (
+    BrowserController,
+    ConfigManager,
+    HotkeyManager,
+    LicenseManager,
+    ScheduleManager,
+)
 from JD_Live_Assistant.ui.main_window import MainWindow
 
 
@@ -40,11 +46,13 @@ def main() -> None:
 
     config_path = base_dir / "config" / "settings.yaml"
     config_manager = ConfigManager(config_path)
+    license_path = base_dir / "config" / "license.json"
+    license_manager = LicenseManager(license_path)
     controller = BrowserController()
     scheduler = ScheduleManager()
     hotkeys = HotkeyManager()
 
-    app = MainWindow(controller, scheduler, hotkeys, config_manager)
+    app = MainWindow(controller, scheduler, hotkeys, config_manager, license_manager)
     app.mainloop()
 
 
