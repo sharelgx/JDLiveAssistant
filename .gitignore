@@ -18,6 +18,9 @@ dist/
 *.log
 logs/
 
+# Local-only docs
+docs/卡点讲解自动化软件（Cursor开发版）开发文档.md
+
 # IDE
 .idea/
 .vscode/
