@@ -1,0 +1,10 @@
+app:
+  default_port: 9222
+  live_url: "https://live.jd.com/#/anchor/live-list"
+schedule:
+  daily_start_time: "09:00"
+hotkeys:
+  start_live: "ctrl+alt+f5"
+  stop_live: "ctrl+alt+f6"
+  refresh: "ctrl+alt+r"
+

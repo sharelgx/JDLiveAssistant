@@ -1,0 +1,6 @@
+apscheduler>=3.10
+keyboard>=0.13
+loguru>=0.7
+playwright>=1.47
+PyYAML>=6.0
+
