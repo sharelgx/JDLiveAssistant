@@ -2111,9 +2111,84 @@ class MainWindow(tk.Tk):
                 self._log("页面状态已稳定，开始讲解")
                 self._log(f"开始讲解：{title}")
                 
-                # 等待讲解时间
-                if self.task_stop_event.wait(duration):
-                    break
+                # 等待讲解时间：与页面显示的“讲解中”计时同步
+                self._log(f"开始监控页面讲解时长，目标 {duration} 秒")
+                start_time = time.time()
+                last_timer_text: Optional[str] = None
+                timer_not_found_logged = False
+                while not self.task_stop_event.is_set():
+                    elapsed = time.time() - start_time
+                    reached = False
+                    timer_info = None
+                    try:
+                        timer_info = with_context(
+                            lambda ctx, idx=index: ctx.evaluate(
+                                """
+                                ({ itemSelector, index }) => {
+                                    const items = Array.from(document.querySelectorAll(itemSelector));
+                                    const item = items[index];
+                                    if (!item) {
+                                        return null;
+                                    }
+                                    const timerNode = item.querySelector('.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-newExplain');
+                                    if (!timerNode) {
+                                        return { text: null, seconds: null };
+                                    }
+                                    const rawText = (timerNode.textContent || '').trim();
+                                    const match = rawText.match(/(\\d{1,2}:\\d{2})$/);
+                                    if (!match) {
+                                        return { text: rawText || null, seconds: null };
+                                    }
+                                    const timeText = match[1];
+                                    const parts = timeText.split(':');
+                                    const minutes = parseInt(parts[0], 10);
+                                    const seconds = parseInt(parts[1], 10);
+                                    if (Number.isNaN(minutes) || Number.isNaN(seconds)) {
+                                        return { text: timeText, seconds: null };
+                                    }
+                                    return {
+                                        text: timeText,
+                                        seconds: minutes * 60 + seconds,
+                                    };
+                                }
+                                """,
+                                {
+                                    "itemSelector": item_selector,
+                                    "index": index,
+                                },
+                            ),
+                            require_selector=False,
+                        )
+                    except Exception as timer_exc:  # noqa: BLE001
+                        logger.debug("获取页面讲解计时器失败: {}", timer_exc)
+                        timer_info = None
+                    
+                    if timer_info and timer_info.get("seconds") is not None:
+                        current_seconds = timer_info["seconds"]
+                        timer_text = timer_info.get("text") or ""
+                        if timer_text and timer_text != last_timer_text:
+                            self._log(f"页面讲解计时：{timer_text}（{current_seconds} 秒）")
+                            last_timer_text = timer_text
+                        if current_seconds >= duration:
+                            self._log(f"页面讲解计时达到目标 {duration} 秒（当前 {timer_text}），准备停止当前讲解")
+                            reached = True
+                    else:
+                        if not timer_not_found_logged:
+                            self._log("未检测到页面讲解计时器，使用本地计时作为兜底")
+                            timer_not_found_logged = True
+                        if elapsed >= duration:
+                            self._log(f"本地计时达到 {duration} 秒，页面未提供有效计时，准备停止当前讲解")
+                            reached = True
+                    
+                    if reached:
+                        break
+                    
+                    if elapsed >= duration * 2:
+                        self._log(f"页面计时迟迟未达到目标，已等待 {elapsed:.1f} 秒，安全停止当前讲解")
+                        break
+                    
+                    if self.task_stop_event.wait(1):
+                        break
                 
                 # 在开始下一个商品之前，先停止当前讲解
                 self._log(f"讲解时间到，准备停止当前讲解：{title}")
