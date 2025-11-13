@@ -373,8 +373,10 @@ class MainWindow(tk.Tk):
 
     def _task_worker(self, directory: Path, duration: float, interval: float, port: int) -> None:
         controller = BrowserController()
-        # 商品项选择器 - 使用更通用的选择器策略
-        item_selector = "div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-wrapper"
+        # 商品项选择器 - 支持新的表格结构
+        # 新结构：商品在 <tr class="ant-table-row"> 中，容器是 skuContainer
+        # 旧结构：商品在 div.wrapper 中
+        item_selector = "tr.ant-table-row, div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-skuContainer, div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-wrapper"
         # 图片选择器 - 优先使用特定类名，如果没有则回退到通用img
         image_selector = "img.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-img"
         # 按钮选择器 - 查找包含"讲解"文本的按钮
@@ -397,7 +399,7 @@ class MainWindow(tk.Tk):
                         # 等待页面加载完成
                         page.wait_for_load_state("networkidle", timeout=10000)
                         if require_selector:
-                            page.wait_for_selector(item_selector, timeout=10000)
+                            page.wait_for_selector(item_selector, timeout=10000, state="attached")
                         return callback(page)
                     except Exception:
                         if not require_selector:
@@ -410,7 +412,7 @@ class MainWindow(tk.Tk):
                         frames = page.frames
                         for candidate in frames:
                             try:
-                                candidate.wait_for_selector(item_selector, timeout=3000)
+                                candidate.wait_for_selector(item_selector, timeout=5000, state="attached")
                                 return callback(candidate)
                             except Exception:
                                 continue
@@ -433,14 +435,318 @@ class MainWindow(tk.Tk):
                 logger.exception("页面加载失败")
                 self._log(f"页面加载失败：{exc}")
 
+            # 先检查页面状态，获取诊断信息
+            self._log("检查页面状态...")
+            page_info = None
+            try:
+                # 首先检查所有frames的信息
+                try:
+                    frames_info = controller.perform(
+                        lambda page: {
+                            "main_url": page.url,
+                            "main_title": page.title,
+                            "frame_count": len(page.frames),
+                            "frames": [
+                                {
+                                    "url": frame.url,
+                                    "name": frame.name or "",
+                                    "title": frame.title() if hasattr(frame, 'title') else "",
+                                    "is_main": frame == page.main_frame
+                                }
+                                for frame in page.frames[:10]  # 限制最多10个frames
+                            ]
+                        }
+                    )
+                    if frames_info:
+                        self._log(f"页面框架信息：")
+                        self._log(f"  - 主页面URL: {frames_info.get('main_url', '未知')}")
+                        self._log(f"  - 主页面标题: {frames_info.get('main_title', '未知')}")
+                        self._log(f"  - 框架总数: {frames_info.get('frame_count', 0)}")
+                        for idx, frame_info in enumerate(frames_info.get('frames', [])[:5]):
+                            frame_type = "主框架" if frame_info.get('is_main') else "子框架"
+                            self._log(f"  - 框架{idx+1} ({frame_type}): {frame_info.get('url', '未知')[:100]}")
+                except Exception as frame_exc:
+                    logger.debug("检查frames失败: {}", frame_exc)
+                    self._log(f"检查frames失败: {frame_exc}")
+                
+                page_info = controller.perform(
+                    lambda page: page.evaluate("""
+                        () => {
+                            // 检查页面加载状态
+                            const readyState = document.readyState;
+                            const hasBody = !!document.body;
+                            const bodyChildren = hasBody ? document.body.children.length : 0;
+                            
+                            // 检查是否有加载动画
+                            const loadingElements = document.querySelectorAll('.ant-spin-spinning, .page-loading-warp, [class*="loading"], [class*="spin"]');
+                            const hasLoading = loadingElements.length > 0;
+                            
+                            // 检查iframe数量
+                            const iframes = document.querySelectorAll('iframe');
+                            
+                            // 检查表格行（新结构）
+                            const tableRows = document.querySelectorAll('tr.ant-table-row');
+                            
+                            // 检查表格（更通用的选择器）
+                            const tables = document.querySelectorAll('table');
+                            const antTables = document.querySelectorAll('table.ant-table, .ant-table');
+                            
+                            // 检查商品容器（新结构）
+                            const skuContainers = document.querySelectorAll('div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-skuContainer');
+                            
+                            // 检查旧结构的商品容器
+                            const oldWrappers = document.querySelectorAll('div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-wrapper');
+                            
+                            // 检查是否有商品相关的元素
+                            const goodsElements = document.querySelectorAll('[class*="goods"], [class*="sku"], [class*="item"]');
+                            
+                            // 获取所有包含"讲解"文本的按钮
+                            const explainButtons = Array.from(document.querySelectorAll('button, a, span, div')).filter(el => {
+                                const text = (el.textContent || '').trim();
+                                return text === '讲解' || text.includes('讲解');
+                            });
+                            
+                            // 检查tbody
+                            const tbody = document.querySelector('tbody.ant-table-tbody');
+                            const allTbodies = document.querySelectorAll('tbody');
+                            
+                            // 检查所有tr元素
+                            const allTrs = document.querySelectorAll('tr');
+                            const trsWithAntTableRow = Array.from(allTrs).filter(tr => {
+                                const className = tr.className || '';
+                                return typeof className === 'string' && className.includes('ant-table-row');
+                            });
+                            
+                            // 查找包含"讲解"按钮的父容器
+                            const goodsContainers = new Set();
+                            const explainButtonDetails = [];
+                            explainButtons.forEach((btn, idx) => {
+                                const btnText = (btn.textContent || '').trim();
+                                const btnTag = btn.tagName || '';
+                                const btnClass = (btn.className || '').toString();
+                                
+                                explainButtonDetails.push({
+                                    index: idx,
+                                    tag: btnTag,
+                                    class: btnClass.substring(0, 100),
+                                    text: btnText.substring(0, 50)
+                                });
+                                
+                                let parent = btn.parentElement;
+                                let depth = 0;
+                                while (parent && depth < 10) {
+                                    if (parent.tagName === 'TR' || (parent.classList && parent.classList.length > 0)) {
+                                        const className = parent.className;
+                                        if (typeof className === 'string' && className.trim()) {
+                                            goodsContainers.add(className.split(' ')[0]);
+                                        } else if (parent.tagName === 'TR') {
+                                            goodsContainers.add('TR');
+                                        }
+                                    }
+                                    parent = parent.parentElement;
+                                    depth++;
+                                }
+                            });
+                            
+                            // 检查页面是否有内容
+                            const hasContent = document.body && document.body.innerHTML && document.body.innerHTML.length > 100;
+                            
+                            // 检查是否有React根元素
+                            const reactRoots = document.querySelectorAll('[id*="root"], [id*="app"], [class*="root"], [class*="app"]');
+                            
+                            return {
+                                readyState: readyState,
+                                hasBody: hasBody,
+                                bodyChildren: bodyChildren,
+                                hasContent: hasContent,
+                                hasLoading: hasLoading,
+                                loadingCount: loadingElements.length,
+                                iframeCount: iframes.length,
+                                tableCount: tables.length,
+                                antTableCount: antTables.length,
+                                tableRowCount: tableRows.length,
+                                allTrCount: allTrs.length,
+                                trsWithAntTableRowCount: trsWithAntTableRow.length,
+                                skuContainerCount: skuContainers.length,
+                                oldWrapperCount: oldWrappers.length,
+                                goodsCount: goodsElements.length,
+                                explainButtonCount: explainButtons.length,
+                                explainButtonDetails: explainButtonDetails.slice(0, 5), // 只返回前5个按钮的详情
+                                hasTbody: !!tbody,
+                                tbodyCount: allTbodies.length,
+                                reactRootCount: reactRoots.length,
+                                url: window.location.href,
+                                title: document.title,
+                                containerClasses: Array.from(goodsContainers).slice(0, 10),
+                                bodyHtmlLength: hasBody ? document.body.innerHTML.length : 0
+                            };
+                        }
+                    """)
+                )
+                
+                if page_info:
+                    self._log(f"页面状态：")
+                    self._log(f"  - 当前URL: {page_info.get('url', '未知')}")
+                    self._log(f"  - 页面标题: {page_info.get('title', '未知')}")
+                    self._log(f"  - 页面readyState: {page_info.get('readyState', '未知')}")
+                    self._log(f"  - 是否有body: {page_info.get('hasBody', False)}")
+                    self._log(f"  - body子元素数量: {page_info.get('bodyChildren', 0)}")
+                    self._log(f"  - body HTML长度: {page_info.get('bodyHtmlLength', 0)} 字符")
+                    self._log(f"  - 是否有内容: {page_info.get('hasContent', False)}")
+                    self._log(f"  - React根元素数量: {page_info.get('reactRootCount', 0)}")
+                    self._log(f"  - iframe数量: {page_info.get('iframeCount', 0)}")
+                    self._log(f"  - 是否有加载动画: {page_info.get('hasLoading', False)} (数量: {page_info.get('loadingCount', 0)})")
+                    self._log(f"  - 表格数量: {page_info.get('tableCount', 0)}")
+                    self._log(f"  - Ant Design表格数量: {page_info.get('antTableCount', 0)}")
+                    self._log(f"  - tbody数量: {page_info.get('tbodyCount', 0)}")
+                    self._log(f"  - 所有tr元素数量: {page_info.get('allTrCount', 0)}")
+                    self._log(f"  - 包含'ant-table-row'类的tr数量: {page_info.get('trsWithAntTableRowCount', 0)}")
+                    self._log(f"  - 表格行数量 (tr.ant-table-row): {page_info.get('tableRowCount', 0)}")
+                    self._log(f"  - 商品容器数量 (skuContainer): {page_info.get('skuContainerCount', 0)}")
+                    self._log(f"  - 旧容器数量 (wrapper): {page_info.get('oldWrapperCount', 0)}")
+                    self._log(f"  - 商品相关元素数量: {page_info.get('goodsCount', 0)}")
+                    self._log(f"  - '讲解'按钮数量: {page_info.get('explainButtonCount', 0)}")
+                    self._log(f"  - 是否有tbody.ant-table-tbody: {page_info.get('hasTbody', False)}")
+                    
+                    # 显示"讲解"按钮的详细信息
+                    explain_button_details = page_info.get('explainButtonDetails', [])
+                    if explain_button_details:
+                        self._log(f"  - '讲解'按钮详情（前{len(explain_button_details)}个）:")
+                        for btn_detail in explain_button_details:
+                            self._log(f"    按钮{btn_detail.get('index', 0)+1}: 标签={btn_detail.get('tag', '')}, 类名={btn_detail.get('class', '')[:50]}, 文本={btn_detail.get('text', '')}")
+                    
+                    container_classes = page_info.get('containerClasses', [])
+                    if container_classes:
+                        self._log(f"  - 检测到的商品容器类名: {', '.join(container_classes[:5])}")
+                    
+                    # 诊断建议
+                    if not page_info.get('hasBody'):
+                        self._log("⚠️ 警告: 页面没有body元素，可能页面还未加载")
+                    elif page_info.get('bodyHtmlLength', 0) < 100:
+                        self._log("⚠️ 警告: body内容很少，可能页面内容未加载")
+                    elif page_info.get('readyState') != 'complete':
+                        self._log(f"⚠️ 警告: 页面readyState为'{page_info.get('readyState')}'，可能还在加载中")
+                    
+                    if page_info.get('hasLoading'):
+                        self._log("页面仍在加载中，等待加载完成...")
+                        time.sleep(5)
+                    
+                    # 如果找到表格行，直接使用表格行作为选择器
+                    if page_info.get('tableRowCount', 0) > 0:
+                        self._log(f"✓ 检测到 {page_info.get('tableRowCount')} 个表格行，将优先使用表格行选择器")
+                    elif page_info.get('allTrCount', 0) > 0:
+                        self._log(f"⚠️ 找到 {page_info.get('allTrCount')} 个tr元素，但都不包含'ant-table-row'类")
+                    
+                    # 如果找到"讲解"按钮，尝试通过按钮定位商品容器
+                    if page_info.get('explainButtonCount', 0) > 0:
+                        self._log(f"✓ 找到 {page_info.get('explainButtonCount')} 个'讲解'按钮")
+                    else:
+                        self._log("⚠️ 未找到'讲解'按钮，可能页面结构已改变或页面未完全加载")
+                    
+                    logger.info(
+                        "页面状态诊断 -> url={}, readyState={}, tr.ant-table-row={}, skuContainer={}, explainButtons={}, goodsElements={}, hasLoading={}, iframeCount={}",
+                        page_info.get('url'),
+                        page_info.get('readyState'),
+                        page_info.get('tableRowCount'),
+                        page_info.get('skuContainerCount'),
+                        page_info.get('explainButtonCount'),
+                        page_info.get('goodsCount'),
+                        page_info.get('hasLoading'),
+                        page_info.get('iframeCount'),
+                    )
+            except Exception as e:
+                logger.warning("页面状态检查失败: {}", e)
+                self._log(f"页面状态检查失败: {e}")
+            
+            # 如果页面状态检查成功，但没找到元素，尝试在所有frames中查找
+            if page_info and page_info.get('tableRowCount', 0) == 0 and page_info.get('skuContainerCount', 0) == 0:
+                self._log("页面状态检查显示未找到表格行和容器，尝试在所有frames中查找...")
+                try:
+                    frames_check = controller.perform(
+                        lambda page: {
+                            "main_frame": {
+                                "url": page.url,
+                                "tr_count": len(page.query_selector_all("tr")),
+                                "table_row_count": len(page.query_selector_all("tr.ant-table-row")),
+                                "explain_button_count": len([el for el in page.query_selector_all("button, a, span, div") if "讲解" in (el.inner_text() or "")])
+                            },
+                            "other_frames": [
+                                {
+                                    "url": frame.url,
+                                    "name": frame.name or "",
+                                    "tr_count": len(frame.query_selector_all("tr")) if hasattr(frame, 'query_selector_all') else 0,
+                                    "table_row_count": len(frame.query_selector_all("tr.ant-table-row")) if hasattr(frame, 'query_selector_all') else 0,
+                                    "explain_button_count": len([el for el in frame.query_selector_all("button, a, span, div") if "讲解" in (el.inner_text() or "")]) if hasattr(frame, 'query_selector_all') else 0
+                                }
+                                for frame in page.frames[1:6]  # 检查前5个子frames
+                            ]
+                        }
+                    )
+                    if frames_check:
+                        main_info = frames_check.get("main_frame", {})
+                        self._log(f"主框架: URL={main_info.get('url', '未知')[:80]}, tr数量={main_info.get('tr_count', 0)}, 表格行数量={main_info.get('table_row_count', 0)}, 讲解按钮数量={main_info.get('explain_button_count', 0)}")
+                        for idx, frame_info in enumerate(frames_check.get("other_frames", [])):
+                            if frame_info.get('tr_count', 0) > 0 or frame_info.get('explain_button_count', 0) > 0:
+                                self._log(f"子框架{idx+1}: URL={frame_info.get('url', '未知')[:80]}, tr数量={frame_info.get('tr_count', 0)}, 表格行数量={frame_info.get('table_row_count', 0)}, 讲解按钮数量={frame_info.get('explain_button_count', 0)}")
+                    logger.info(
+                        "frame诊断 -> main(url={}, tr={}, tr_ant={}, explain={}), 子frame数量={}",
+                        main_info.get('url'),
+                        main_info.get('tr_count'),
+                        main_info.get('table_row_count'),
+                        main_info.get('explain_button_count'),
+                        len(frames_check.get("other_frames", [])),
+                    )
+                except Exception as frames_exc:
+                    logger.debug("检查frames失败: {}", frames_exc)
+                    self._log(f"检查frames失败: {frames_exc}")
+                
+                # 尝试直接使用JavaScript查找所有可能的元素
+                self._log("尝试直接查找所有tr元素...")
+                try:
+                    all_trs = controller.perform(
+                        lambda page: page.evaluate("""
+                            () => {
+                                const allTrs = document.querySelectorAll('tr');
+                                return {
+                                    total: allTrs.length,
+                                    withClass: Array.from(allTrs).filter(tr => tr.className && tr.className.includes('ant-table-row')).length,
+                                    firstTrClass: allTrs.length > 0 ? (allTrs[0].className || '') : '',
+                                    firstTrHtml: allTrs.length > 0 ? (allTrs[0].outerHTML || '').substring(0, 200) : ''
+                                };
+                            }
+                        """)
+                    )
+                    if all_trs:
+                        self._log(f"  找到 {all_trs.get('total', 0)} 个tr元素，其中 {all_trs.get('withClass', 0)} 个包含'ant-table-row'类")
+                        if all_trs.get('firstTrClass'):
+                            self._log(f"  第一个tr的类名: {all_trs.get('firstTrClass')}")
+                        if all_trs.get('firstTrHtml'):
+                            self._log(f"  第一个tr的HTML片段: {all_trs.get('firstTrHtml')}")
+                        logger.info(
+                            "all_tr诊断 -> total={}, with_ant={}, first_tr_class={}",
+                            all_trs.get('total', 0),
+                            all_trs.get('withClass', 0),
+                            all_trs.get('firstTrClass'),
+                        )
+                except Exception as tr_exc:
+                    logger.debug("查找tr元素失败: {}", tr_exc)
+            
             # 尝试多种选择器策略，增加等待时间
+            # 优先尝试通过"讲解"按钮定位商品（使用JavaScript方式）
             alternative_selectors = [
+                # 方法1: 新的表格结构选择器（优先）
+                "tr.ant-table-row",
+                "div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-skuContainer",
+                # 方法2: 原始选择器（兼容旧结构）
                 item_selector,
+                "div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-wrapper",
+                # 方法3: 通用选择器
                 "div[class*='goods'][class*='item']",
                 "div[class*='sku'][class*='item']",
                 "div[class*='goods-sku']",
-                ".antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-wrapper",
                 "[class*='wrapper'][class*='goods']",
+                "div[class*='goods']",
+                "div[class*='sku']",
             ]
 
             found_selector = None
@@ -453,22 +759,186 @@ class MainWindow(tk.Tk):
                 for alt_selector in alternative_selectors:
                     try:
                         self._log(f"尝试选择器: {alt_selector}")
-                        result = controller.perform(
-                            lambda page, selector=alt_selector: (
-                                # 先等待选择器出现
-                                page.wait_for_selector(selector, timeout=3000),
-                                len(page.query_selector_all(selector))
+                        # 先尝试使用Playwright选择器
+                        try:
+                            result = controller.perform(
+                                lambda page, selector=alt_selector: (
+                                    # 先等待选择器出现
+                                    page.wait_for_selector(selector, timeout=5000, state="attached"),
+                                    len(page.query_selector_all(selector))
+                                )
                             )
-                        )
-                        if result and result[1] > 0:
-                            found_selector = alt_selector
-                            self._log(f"找到 {result[1]} 个商品，使用选择器: {alt_selector}")
-                            break
-                    except Exception:
+                            if result and result[1] > 0:
+                                found_selector = alt_selector
+                                self._log(f"找到 {result[1]} 个商品，使用选择器: {alt_selector}")
+                                break
+                        except Exception as pw_exc:
+                            # 如果Playwright选择器失败，尝试使用JavaScript直接查找
+                            logger.debug("Playwright选择器失败，尝试JavaScript查找: {}", pw_exc)
+                            try:
+                                js_result = controller.perform(
+                                    lambda page, sel=alt_selector: page.evaluate("""
+                                        (selector) => {
+                                            try {
+                                                const elements = document.querySelectorAll(selector);
+                                                const firstEl = elements.length > 0 ? elements[0] : null;
+                                                let firstElementInfo = null;
+                                                if (firstEl) {
+                                                    const tagName = firstEl.tagName || '';
+                                                    const className = firstEl.className || '';
+                                                    const classStr = typeof className === 'string' ? className : (Array.isArray(className) ? className.join(' ') : String(className));
+                                                    firstElementInfo = tagName + (classStr ? '.' + classStr.split(' ')[0] : '');
+                                                }
+                                                return {
+                                                    count: elements.length,
+                                                    found: elements.length > 0,
+                                                    firstElement: firstElementInfo,
+                                                    selector: selector
+                                                };
+                                            } catch (e) {
+                                                return { 
+                                                    count: 0, 
+                                                    found: false, 
+                                                    error: e.message,
+                                                    selector: selector
+                                                };
+                                            }
+                                        }
+                                    """, alt_selector)
+                                )
+                                if js_result:
+                                    if js_result.get('found') and js_result.get('count', 0) > 0:
+                                        found_selector = alt_selector
+                                        self._log(f"✓ 通过JavaScript找到 {js_result.get('count')} 个商品，使用选择器: {alt_selector}")
+                                        if js_result.get('firstElement'):
+                                            self._log(f"  第一个元素: {js_result.get('firstElement')}")
+                                        logger.info(
+                                            "JS选择器成功 -> selector={}, count={}, firstElement={}",
+                                            alt_selector,
+                                            js_result.get('count'),
+                                            js_result.get('firstElement'),
+                                        )
+                                        break
+                                    elif js_result.get('error'):
+                                        logger.debug("JavaScript查找出错: {}", js_result.get('error'))
+                                    else:
+                                        logger.info(
+                                            "JS选择器未找到元素 -> selector={}, count={}",
+                                            alt_selector,
+                                            js_result.get('count'),
+                                        )
+                            except Exception as js_exc:
+                                logger.debug("JavaScript查找异常: {}", js_exc)
+                                continue
+                    except Exception as e:
+                        # 记录失败原因以便调试
+                        logger.debug("选择器 {} 失败: {}", alt_selector, e)
                         continue
                 
                 if found_selector:
                     break
+                
+                # 如果还没找到，尝试通过JavaScript直接查找包含"讲解"按钮的元素
+                if not found_selector and attempt >= 1:
+                    try:
+                        self._log("尝试通过JavaScript查找包含'讲解'按钮的商品容器...")
+                        js_result = controller.perform(
+                            lambda page: page.evaluate("""
+                                () => {
+                                    // 查找所有包含"讲解"文本的元素
+                                    const allElements = Array.from(document.querySelectorAll('*'));
+                                    const explainElements = allElements.filter(el => {
+                                        const text = (el.textContent || '').trim();
+                                        return text === '讲解' || (text.includes('讲解') && text.length < 10);
+                                    });
+                                    
+                                    if (explainElements.length === 0) {
+                                        return { count: 0, buttonCount: 0, found: false, selectors: [] };
+                                    }
+                                    
+                                    // 找到这些元素的父容器，并提取选择器
+                                    const containers = [];
+                                    const seenClasses = new Set();
+                                    
+                                    explainElements.forEach(el => {
+                                        let parent = el.parentElement;
+                                        let depth = 0;
+                                        while (parent && depth < 8) {
+                                            if (parent.tagName === 'DIV' && parent.className) {
+                                                let className = '';
+                                                if (typeof parent.className === 'string') {
+                                                    className = parent.className;
+                                                } else if (parent.className.baseVal) {
+                                                    className = parent.className.baseVal;
+                                                } else if (Array.isArray(parent.className)) {
+                                                    className = parent.className.join(' ');
+                                                } else {
+                                                    className = String(parent.className);
+                                                }
+                                                
+                                                if (className && className.trim() && !seenClasses.has(className)) {
+                                                    seenClasses.add(className);
+                                                    // 尝试构建选择器
+                                                    const classParts = className.split(' ').filter(c => c && c.length > 0);
+                                                    if (classParts.length > 0) {
+                                                        // 使用第一个有意义的类名
+                                                        const selector = '.' + classParts[0].replace(/\s+/g, '.');
+                                                        containers.push({
+                                                            selector: selector,
+                                                            className: className,
+                                                            element: parent
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            parent = parent.parentElement;
+                                            depth++;
+                                        }
+                                    });
+                                    
+                                    // 去重并返回最常用的选择器
+                                    const selectorCounts = {};
+                                    containers.forEach(c => {
+                                        selectorCounts[c.selector] = (selectorCounts[c.selector] || 0) + 1;
+                                    });
+                                    
+                                    const sortedSelectors = Object.entries(selectorCounts)
+                                        .sort((a, b) => b[1] - a[1])
+                                        .slice(0, 3)
+                                        .map(([sel]) => sel);
+                                    
+                                    return {
+                                        count: containers.length,
+                                        buttonCount: explainElements.length,
+                                        found: containers.length > 0,
+                                        selectors: sortedSelectors
+                                    };
+                                }
+                            """)
+                        )
+                        
+                        if js_result and js_result.get('found') and js_result.get('count', 0) > 0:
+                            self._log(f"通过JavaScript找到 {js_result.get('buttonCount')} 个'讲解'按钮，位于 {js_result.get('count')} 个容器中")
+                            selectors = js_result.get('selectors', [])
+                            if selectors:
+                                self._log(f"尝试使用JavaScript找到的选择器: {', '.join(selectors)}")
+                                # 尝试使用找到的选择器
+                                for js_selector in selectors:
+                                    try:
+                                        result = controller.perform(
+                                            lambda page, sel=js_selector: (
+                                                page.wait_for_selector(sel, timeout=5000, state="attached"),
+                                                len(page.query_selector_all(sel))
+                                            )
+                                        )
+                                        if result and result[1] > 0:
+                                            found_selector = js_selector
+                                            self._log(f"成功使用JavaScript找到的选择器: {js_selector}，找到 {result[1]} 个元素")
+                                            break
+                                    except Exception:
+                                        continue
+                    except Exception as js_e:
+                        logger.debug("JavaScript查找失败: {}", js_e)
 
             if not found_selector:
                 # 如果所有选择器都失败，尝试输出页面内容用于诊断
@@ -982,9 +1452,6 @@ class MainWindow(tk.Tk):
                 # 注意：在处理完成后才添加索引，避免处理失败时误标记
                 # 这里先不添加，等处理完成后再添加
                 
-                # ========== 测试模式：暂时隐藏点击"讲解"按钮功能 ==========
-                self._log("【测试模式】跳过点击讲解按钮，直接下载图片")
-                
                 # 先下载图片
                 info = with_context(
                     lambda ctx, idx=index: ctx.evaluate(
@@ -1393,52 +1860,123 @@ class MainWindow(tk.Tk):
                     continue
                 self._log("下载完成。")
 
-                # ========== 测试模式：暂时隐藏点击"讲解"按钮功能 ==========
-                # 跳过点击讲解按钮，直接标记为已处理并继续下一个商品
-                self._log("【测试模式】跳过点击讲解按钮，直接准备下一个商品")
-                
-                # 处理完成后，将索引和SKU添加到已处理列表
-                processed_indices.add(index)
-                if sku:
-                    processed_skus.add(sku)
-                last_processed_index = index  # 记录本次处理的索引
-                last_processed_sku = sku  # 记录本次处理的SKU
-                self._log(f"已记录商品（索引: {index}, SKU: {sku}）到已处理列表（图片已下载）")
-                
-                processed_count += 1
-                
-                # 如果还有商品未处理，等待间隔时间
-                if processed_count < goods_count and interval > 0:
-                    self._log(f"等待 {interval} 秒准备下一个商品。")
-                    if self.task_stop_event.wait(interval):
-                        break
-                    
-                    # 间隔等待后，再次确保页面稳定
-                    try:
-                        with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=5000), require_selector=False)
-                        time.sleep(0.5)  # 确保页面状态更新
-                    except Exception:
-                        pass
-                
-                # 继续下一个商品
-                continue
-                
-                # ========== 原始代码（已注释，用于测试后恢复）==========
-                # # 使用JavaScript查找并点击"讲解"按钮
-                # clicked = False
-                # try:
-                #     clicked = with_context(...)
-                # except Exception as exc:
-                #     logger.exception("点击讲解按钮时发生异常")
-                #     self._log(f"点击按钮异常：{exc}")
-                #     clicked = False
-                # 
-                # if not clicked:
-                #     self._log(f"未找到第 {processed_count + 1} 个商品的讲解按钮，跳过。")
-                #     processed_count += 1
-                #     continue
-                # 
-                # self._log(f"已点击讲解按钮：{title}")
+                # 使用JavaScript查找并点击"讲解"按钮
+                clicked = False
+                try:
+                    clicked = with_context(
+                        lambda ctx, idx=index: ctx.evaluate(
+                            """
+                            ({ itemSelector, buttonSelector, index }) => {
+                                const items = Array.from(document.querySelectorAll(itemSelector));
+                                const item = items[index];
+                                if (!item) {
+                                    return false;
+                                }
+                                
+                                const isDropdownTrigger = (node) => {
+                                    if (!node) return false;
+                                    const text = (node.textContent || '').trim();
+                                    if (text === '...' || text === '⋯' || text === '⋮' || (text.length <= 2 && text !== '讲解')) {
+                                        return true;
+                                    }
+                                    const className = node.className || '';
+                                    if (typeof className === 'string') {
+                                        const lower = className.toLowerCase();
+                                        if (lower.includes('dropdown') || lower.includes('more') || lower.includes('trigger')) {
+                                            return true;
+                                        }
+                                    }
+                                    let parent = node.parentElement;
+                                    let depth = 0;
+                                    while (parent && depth < 3) {
+                                        const parentClass = parent.className || '';
+                                        if (typeof parentClass === 'string') {
+                                            const lower = parentClass.toLowerCase();
+                                            if (lower.includes('dropdown') || lower.includes('menu')) {
+                                                return true;
+                                            }
+                                        }
+                                        parent = parent.parentElement;
+                                        depth++;
+                                    }
+                                    return false;
+                                };
+                                
+                                const getFullText = (node) => {
+                                    if (!node) return '';
+                                    let text = (node.textContent || '').trim();
+                                    if (!text) {
+                                        text = (node.innerText || '').trim();
+                                    }
+                                    if (!text) {
+                                        const span = node.querySelector('span');
+                                        if (span) {
+                                            text = (span.textContent || span.innerText || '').trim();
+                                        }
+                                    }
+                                    return text;
+                                };
+                                
+                                let button = null;
+                                
+                                if (buttonSelector) {
+                                    const buttons = Array.from(item.querySelectorAll(buttonSelector));
+                                    button = buttons.find((node) => getFullText(node) === '讲解');
+                                }
+                                
+                                if (!button) {
+                                    const candidates = Array.from(item.querySelectorAll('button, span, div, a'));
+                                    button = candidates.find((node) => getFullText(node) === '讲解' && !isDropdownTrigger(node));
+                                }
+                                
+                                if (!button) {
+                                    return false;
+                                }
+                                
+                                try {
+                                    button.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                } catch (e) {}
+                                
+                                try {
+                                    button.click();
+                                    return true;
+                                } catch (e) {
+                                    try {
+                                        const clickEvent = new MouseEvent('click', {
+                                            bubbles: true,
+                                            cancelable: true,
+                                            view: window,
+                                        });
+                                        button.dispatchEvent(clickEvent);
+                                        return true;
+                                    } catch (e2) {
+                                        return false;
+                                    }
+                                }
+                            }
+                            """,
+                            {
+                                "itemSelector": item_selector,
+                                "buttonSelector": button_selector,
+                                "index": index,
+                            },
+                        ),
+                        require_selector=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("点击讲解按钮时发生异常")
+                    self._log(f"点击按钮异常：{exc}")
+                    clicked = False
+
+                if not clicked:
+                    self._log(f"未找到第 {processed_count + 1} 个商品的讲解按钮，跳过。")
+                    processed_indices.add(index)
+                    if sku:
+                        processed_skus.add(sku)
+                    processed_count += 1
+                    continue
+
+                self._log(f"已点击讲解按钮：{title}")
                 
                 # 只在第一次点击时等待并处理确认模态框
                 if not modal_handled:
@@ -1954,5 +2492,9 @@ class MainWindow(tk.Tk):
                 self.task_thread.join(timeout=5)
             self.scheduler.shutdown()
             self.hotkeys.clear()
-            self.controller.disconnect()
+            if self.controller.is_connected:
+                try:
+                    self.controller.disconnect()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("关闭窗口时断开浏览器连接失败: {}", exc)
             self.destroy()
