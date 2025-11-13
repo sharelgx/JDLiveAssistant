@@ -2193,128 +2193,175 @@ class MainWindow(tk.Tk):
                 # 在开始下一个商品之前，先停止当前讲解
                 self._log(f"讲解时间到，准备停止当前讲解：{title}")
                 try:
-                    # 多次尝试查找停止按钮，因为可能需要等待页面更新
+                    # 先等待一下，确保页面有时间更新显示停止按钮
+                    time.sleep(0.5)
+                    
+                    # 使用 Playwright 的方式查找和点击停止按钮
                     stopped = False
-                    for stop_attempt in range(10):  # 最多尝试10次，每次200ms，共2秒
+                    max_attempts = 20  # 增加尝试次数到20次
+                    
+                    for stop_attempt in range(max_attempts):
                         if self.task_stop_event.is_set():
                             break
                         try:
-                            stopped = with_context(
-                                lambda ctx: ctx.evaluate(
-                                    """
-                                    () => {
-                                        // 查找"结束"按钮
-                                        // 根据HTML结构，"结束"按钮是一个span元素，在包含"取消｜结束"的容器中
+                            # 尝试使用 Playwright 选择器查找停止按钮
+                            def try_click_stop_button(page: Page) -> tuple[bool, str]:
+                                """尝试点击停止按钮，返回(是否成功, 调试信息)"""
+                                debug_msgs = []
+                                
+                                # 获取当前商品项
+                                try:
+                                    items = page.query_selector_all(item_selector)
+                                    if index < len(items):
+                                        current_item = items[index]
+                                        debug_msgs.append(f"找到当前商品项（索引 {index}）")
                                         
-                                        let stopButton = null;
+                                        # 方式1: 在当前商品项内查找"结束"按钮（包含selectBtn和hover类）
+                                        try:
+                                            # 先查找包含这两个类的span
+                                            candidate_spans = current_item.query_selector_all(
+                                                'span.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-hover'
+                                            )
+                                            for span in candidate_spans:
+                                                text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
+                                                if text == '结束':
+                                                    debug_msgs.append("方式1: 在当前商品项内找到停止按钮（selectBtn+hover）")
+                                                    span.scroll_into_view_if_needed()
+                                                    span.click(timeout=1000)
+                                                    return True, " | ".join(debug_msgs)
+                                        except Exception:
+                                            pass
                                         
-                                        // 方式1: 查找包含"结束"文本的span，且类名包含selectBtn和hover
-                                        // 根据HTML结构：<span class="antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-hover">结束</span>
-                                        const allSpans = Array.from(document.querySelectorAll('span'));
-                                        stopButton = allSpans.find((span) => {
-                                            const text = (span.textContent || span.innerText || '').trim();
-                                            // 检查类名：必须同时包含selectBtn和hover类
-                                            const hasSelectBtnClass = span.classList.contains('antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn');
-                                            const hasHoverClass = span.classList.contains('antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-hover');
-                                            // 严格匹配：文本必须是"结束"，且必须同时有这两个类
-                                            return text === '结束' && hasSelectBtnClass && hasHoverClass;
-                                        });
-                                        
-                                        // 方式2: 查找包含"结束"文本的span，且父元素包含"取消"和"结束"
-                                        if (!stopButton) {
-                                            stopButton = allSpans.find((span) => {
-                                                const text = (span.textContent || '').trim();
-                                                if (text === '结束') {
-                                                    // 向上查找包含"取消"和"结束"的父容器
-                                                    let parent = span.parentElement;
-                                                    while (parent) {
-                                                        const parentText = (parent.textContent || '').trim();
-                                                        if (parentText.includes('取消') && parentText.includes('结束')) {
-                                                            // 检查父元素是否有selectBtn类
-                                                            if (parent.classList.contains('antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn') ||
-                                                                parent.querySelector('.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn')) {
-                                                                return true;
-                                                            }
-                                                        }
-                                                        parent = parent.parentElement;
-                                                    }
-                                                }
-                                                return false;
-                                            });
-                                        }
-                                        
-                                        // 方式3: 查找所有包含"结束"文本的span，且在同一容器中有"取消"
-                                        if (!stopButton) {
-                                            stopButton = allSpans.find((span) => {
-                                                const text = (span.textContent || '').trim();
-                                                if (text === '结束') {
-                                                    // 查找最近的包含"取消"的容器
-                                                    const container = span.closest('[class*="selectBtn"], [class*="buttonContainer"]');
-                                                    if (container) {
-                                                        const containerText = container.textContent || '';
-                                                        return containerText.includes('取消') && containerText.includes('结束');
-                                                    }
-                                                }
-                                                return false;
-                                            });
-                                        }
-                                        
-                                        // 方式4: 查找所有包含"结束"文本的元素
-                                        if (!stopButton) {
-                                            const allElements = Array.from(document.querySelectorAll('span'));
-                                            stopButton = allElements.find((node) => {
-                                                const text = (node.textContent || '').trim();
-                                                return text === '结束';
-                                            });
-                                        }
-                                        
-                                        if (stopButton) {
-                                            // 滚动到按钮位置
-                                            stopButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                            // 等待一下
-                                            const startTime = Date.now();
-                                            while (Date.now() - startTime < 500) {}
+                                        # 方式2: 在当前商品项内查找包含"结束"文本的span
+                                        try:
+                                            all_spans = current_item.query_selector_all('span')
+                                            for span in all_spans:
+                                                text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
+                                                if text == '结束':
+                                                    debug_msgs.append("方式2: 在当前商品项内找到'结束'文本的span")
+                                                    span.scroll_into_view_if_needed()
+                                                    span.click(timeout=1000)
+                                                    return True, " | ".join(debug_msgs)
+                                        except Exception:
+                                            pass
+                                except Exception as e:
+                                    debug_msgs.append(f"获取商品项失败: {e}")
+                                
+                                # 方式3: 在整个页面查找包含"结束"文本的可见按钮
+                                try:
+                                    # 查找所有包含"结束"的span
+                                    all_spans = page.query_selector_all('span')
+                                    for span in all_spans:
+                                        try:
+                                            text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
+                                            if text == '结束':
+                                                # 检查是否可见
+                                                is_visible = span.evaluate('el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }')
+                                                if is_visible:
+                                                    debug_msgs.append("方式3: 在页面中找到可见的'结束'按钮")
+                                                    span.scroll_into_view_if_needed()
+                                                    span.click(timeout=1000)
+                                                    return True, " | ".join(debug_msgs)
+                                        except Exception:
+                                            continue
+                                except Exception:
+                                    pass
+                                
+                                # 方式4: 使用JavaScript查找和点击
+                                try:
+                                    result = page.evaluate("""
+                                        ([itemSelector, itemIndex]) => {
+                                            // 获取当前商品项
+                                            const items = Array.from(document.querySelectorAll(itemSelector));
+                                            const currentItem = items[itemIndex];
                                             
-                                            // 点击停止按钮
-                                            try {
-                                                stopButton.click();
-                                                // 等待点击响应
-                                                const clickWaitTime = Date.now();
-                                                while (Date.now() - clickWaitTime < 200) {}
-                                                return true;
-                                            } catch (e) {
-                                                try {
-                                                    const clickEvent = new MouseEvent('click', {
-                                                        bubbles: true,
-                                                        cancelable: true,
-                                                        view: window
-                                                    });
-                                                    stopButton.dispatchEvent(clickEvent);
-                                                    const clickWaitTime = Date.now();
-                                                    while (Date.now() - clickWaitTime < 200) {}
-                                                    return true;
-                                                } catch (e2) {
-                                                    return false;
+                                            // 优先在当前商品项内查找
+                                            if (currentItem) {
+                                                const itemSpans = Array.from(currentItem.querySelectorAll('span'));
+                                                for (const span of itemSpans) {
+                                                    const text = (span.textContent || '').trim();
+                                                    if (text === '结束') {
+                                                        const rect = span.getBoundingClientRect();
+                                                        if (rect.width > 0 && rect.height > 0) {
+                                                            span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                            setTimeout(() => span.click(), 100);
+                                                            return { success: true, method: 'currentItem' };
+                                                        }
+                                                    }
                                                 }
                                             }
+                                            
+                                            // 在整个页面查找
+                                            const allSpans = Array.from(document.querySelectorAll('span'));
+                                            for (const span of allSpans) {
+                                                const text = (span.textContent || '').trim();
+                                                if (text === '结束') {
+                                                    const rect = span.getBoundingClientRect();
+                                                    if (rect.width > 0 && rect.height > 0) {
+                                                        span.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                        setTimeout(() => span.click(), 100);
+                                                        return { success: true, method: 'page' };
+                                                    }
+                                                }
+                                            }
+                                            
+                                            return { success: false, error: '未找到停止按钮' };
                                         }
-                                        
-                                        return false;
-                                    }
-                                    """
-                                ),
-                                require_selector=False
-                            )
-                            if stopped:
-                                self._log("已点击停止按钮")
-                                time.sleep(1)  # 等待停止操作完成
+                                    """, [item_selector, index])
+                                    
+                                    if result and result.get("success"):
+                                        debug_msgs.append(f"方式4: JavaScript找到并点击停止按钮（方法: {result.get('method')}）")
+                                        return True, " | ".join(debug_msgs)
+                                except Exception as e:
+                                    debug_msgs.append(f"JavaScript查找失败: {e}")
+                                
+                                return False, " | ".join(debug_msgs) if debug_msgs else "未找到停止按钮"
+                            
+                            success, debug_msg = with_context(try_click_stop_button, require_selector=False)
+                            
+                            if success:
+                                self._log(f"✓ 已点击停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）")
+                                self._log(f"  调试信息: {debug_msg}")
+                                stopped = True
+                                time.sleep(2)  # 等待停止操作完成
                                 break
-                        except Exception:
-                            pass
-                        time.sleep(0.2)
+                            else:
+                                # 记录调试信息
+                                if stop_attempt == 0 or stop_attempt % 5 == 0:  # 每5次尝试记录一次
+                                    self._log(f"查找停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）: {debug_msg}")
+                                    
+                                    # 额外记录页面状态
+                                    try:
+                                        page_info = with_context(
+                                            lambda ctx: ctx.evaluate("""
+                                                () => {
+                                                    const allSpans = Array.from(document.querySelectorAll('span'));
+                                                    const endButtons = allSpans.filter(s => (s.textContent || '').trim() === '结束');
+                                                    return {
+                                                        totalEndButtons: endButtons.length,
+                                                        visibleEndButtons: endButtons.filter(s => {
+                                                            const rect = s.getBoundingClientRect();
+                                                            return rect.width > 0 && rect.height > 0;
+                                                        }).length
+                                                    };
+                                                }
+                                            """),
+                                            require_selector=False
+                                        )
+                                        if page_info:
+                                            self._log(f"  页面状态: 共找到 {page_info.get('totalEndButtons', 0)} 个'结束'按钮，其中 {page_info.get('visibleEndButtons', 0)} 个可见")
+                                    except Exception:
+                                        pass
+                                    
+                        except Exception as e:  # noqa: BLE001
+                            if stop_attempt == 0 or stop_attempt % 5 == 0:
+                                logger.debug("查找停止按钮异常（尝试 {}）: {}", stop_attempt + 1, e)
+                                self._log(f"查找停止按钮异常（尝试 {stop_attempt + 1}/{max_attempts}）: {e}")
+                        time.sleep(0.4)  # 等待间隔
                     
                     if not stopped:
-                        self._log("未找到停止按钮，尝试继续...")
+                        self._log(f"⚠️ 警告: 未找到停止按钮（已尝试 {max_attempts} 次），可能页面结构已变化或按钮未显示")
+                        logger.warning("未找到停止按钮，商品: {}", title)
                 except Exception as stop_exc:  # noqa: BLE001
                     logger.exception("停止讲解时发生异常")
                     self._log(f"停止讲解异常：{stop_exc}")
@@ -2573,3 +2620,4 @@ class MainWindow(tk.Tk):
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("关闭窗口时断开浏览器连接失败: {}", exc)
             self.destroy()
+
