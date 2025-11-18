@@ -222,15 +222,21 @@ class BrowserController:
                 raise RuntimeError("浏览器尚未连接，无法执行操作。")
             return callback(self._page)
 
-    def disconnect(self, _lock_acquired: bool = False) -> None:
+    def disconnect(self, _lock_acquired: bool = False, timeout: float = 1.0) -> None:
         """
         断开浏览器连接并释放资源。
         
         Args:
             _lock_acquired: 内部参数，如果为True表示调用者已持有锁，不需要再次获取
+            timeout: 获取锁的超时时间（秒），默认1秒。如果超时则跳过断开操作以避免死锁
         """
+        lock_acquired = False
         if not _lock_acquired:
-            self._lock.acquire()
+            # 尝试获取锁，如果失败则跳过断开操作以避免死锁
+            if not self._lock.acquire(timeout=timeout):
+                logger.warning("无法在{}秒内获取锁，跳过断开操作以避免死锁", timeout)
+                return
+            lock_acquired = True
         
         try:
             if self._page:
@@ -243,18 +249,26 @@ class BrowserController:
                 self._browser = None
             if self._playwright:
                 logger.debug("停止 Playwright 服务")
-                self._playwright.stop()
+                with suppress(Exception):
+                    self._playwright.stop()
                 self._playwright = None
         finally:
-            if not _lock_acquired:
+            if lock_acquired:
                 self._lock.release()
 
     @property
     def is_connected(self) -> bool:
         """当前是否已经绑定浏览器。"""
-
-        return self._browser is not None and self._page is not None
+        # 使用锁保护，确保线程安全
+        with self._lock:
+            return self._browser is not None and self._page is not None
 
     def __del__(self) -> None:
-        self.disconnect()
+        # 在析构函数中使用很短的超时时间，避免在垃圾回收时阻塞
+        # 如果锁被占用，则跳过断开操作，让资源自然释放
+        try:
+            self.disconnect(timeout=0.1)
+        except Exception:
+            # 在析构函数中忽略所有异常，避免影响垃圾回收
+            pass
 

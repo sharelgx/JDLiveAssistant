@@ -47,5 +47,10 @@ class ScheduleManager:
         return self._jobs.get(job_id)
 
     def __del__(self) -> None:
-        self.shutdown()
+        # 在析构函数中捕获异常，避免影响垃圾回收
+        try:
+            self.shutdown()
+        except Exception:
+            # 在析构函数中忽略所有异常，避免影响垃圾回收
+            pass
 
