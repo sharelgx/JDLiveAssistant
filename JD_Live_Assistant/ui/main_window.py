@@ -382,6 +382,160 @@ class MainWindow(tk.Tk):
         # 按钮选择器 - 查找包含"讲解"文本的按钮
         button_selector = ".antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn"
 
+        def with_context(callback: Callable[[Page], Optional[Any]], require_selector: bool = True) -> Optional[Any]:
+            def run(page: Page) -> Optional[Any]:
+                # 先尝试主页面
+                try:
+                    # 等待页面加载完成
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    if require_selector:
+                        page.wait_for_selector(item_selector, timeout=10000, state="attached")
+                    return callback(page)
+                except Exception:
+                    if not require_selector:
+                        # 如果不需要选择器，直接返回主页面
+                        return callback(page)
+                    pass
+                
+                # 如果主页面没有，尝试所有frames
+                if require_selector:
+                    frames = page.frames
+                    for candidate in frames:
+                        try:
+                            candidate.wait_for_selector(item_selector, timeout=5000, state="attached")
+                            return callback(candidate)
+                        except Exception:
+                            continue
+                    raise RuntimeError("未在任何 frame 中检测到商品列表。")
+                else:
+                    # 不需要选择器时，返回主页面
+                    return callback(page)
+
+            return controller.perform(run)
+
+        def _get_pagination_status() -> Dict[str, Any]:
+            """获取分页状态信息。"""
+
+            result = with_context(
+                lambda ctx: ctx.evaluate(
+                    """
+                    () => {
+                        const pagination = document.querySelector('.ant-pagination');
+                        if (!pagination) {
+                            return {
+                                hasPagination: false,
+                                pageCount: 1,
+                                currentPage: 1,
+                                prevDisabled: true,
+                                nextDisabled: true,
+                            };
+                        }
+
+                        const pageItems = Array.from(pagination.querySelectorAll('li.ant-pagination-item'));
+                        const pageNumbers = pageItems
+                            .map((item) => {
+                                const anchor = item.querySelector('a');
+                                const text = anchor ? anchor.textContent : item.textContent;
+                                return text ? parseInt(text.trim(), 10) : NaN;
+                            })
+                            .filter((num) => !Number.isNaN(num))
+                            .sort((a, b) => a - b);
+
+                        const activeItem = pagination.querySelector('li.ant-pagination-item-active');
+                        let currentPage = 1;
+                        if (activeItem) {
+                            const anchor = activeItem.querySelector('a');
+                            const text = anchor ? anchor.textContent : activeItem.textContent;
+                            if (text) {
+                                const parsed = parseInt(text.trim(), 10);
+                                if (!Number.isNaN(parsed)) {
+                                    currentPage = parsed;
+                                }
+                            }
+                        }
+
+                        const pageCount = pageNumbers.length > 0 ? Math.max(...pageNumbers) : 1;
+                        const prev = pagination.querySelector('li.ant-pagination-prev');
+                        const next = pagination.querySelector('li.ant-pagination-next');
+                        const prevDisabled = !!(prev && prev.classList.contains('ant-pagination-disabled'));
+                        const nextDisabled = !!(next && next.classList.contains('ant-pagination-disabled'));
+
+                        return {
+                            hasPagination: pageCount > 1,
+                            pageCount,
+                            currentPage,
+                            prevDisabled,
+                            nextDisabled,
+                        };
+                    }
+                    """
+                ),
+                require_selector=False,
+            )
+
+            if not result:
+                return {
+                    "hasPagination": False,
+                    "pageCount": 1,
+                    "currentPage": 1,
+                    "prevDisabled": True,
+                    "nextDisabled": True,
+                }
+            return result
+
+        def _go_to_page(target_page: int) -> bool:
+            """跳转到指定页码。"""
+
+            if target_page <= 0:
+                return False
+
+            clicked = with_context(
+                lambda ctx, tp=target_page: ctx.evaluate(
+                    """
+                    (targetPage) => {
+                        const direct = document.querySelector(`li.ant-pagination-item-${targetPage} a`);
+                        if (direct) {
+                            direct.click();
+                            return true;
+                        }
+                        const links = Array.from(document.querySelectorAll('li.ant-pagination-item a'));
+                        const target = links.find((link) => link.textContent && link.textContent.trim() === String(targetPage));
+                        if (target) {
+                            target.click();
+                            return true;
+                        }
+                        return false;
+                    }
+                    """,
+                    tp,
+                ),
+                require_selector=False,
+            )
+
+            if not clicked:
+                return False
+
+            try:
+                with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+            except Exception:
+                pass
+            time.sleep(1)
+            return True
+
+        def _go_to_last_page(page_count: int) -> bool:
+            """跳转到最后一页。"""
+
+            if page_count <= 1:
+                return False
+
+            self._log(f"检测到分页，共 {page_count} 页，准备跳转到最后一页开始处理。")
+            success = _go_to_page(page_count)
+            if success:
+                self._log("已跳转到最后一页（倒序第 1 页）。")
+            else:
+                self._log("⚠️ 未能跳转到最后一页，将从当前页开始处理。")
+            return success
+
         try:
             try:
                 controller.connect(port)
@@ -392,36 +546,21 @@ class MainWindow(tk.Tk):
                 self.after(0, lambda e=exc: messagebox.showerror("执行失败", str(e)))
                 return
 
-            def with_context(callback: Callable[[Page], Optional[Any]], require_selector: bool = True) -> Optional[Any]:
-                def run(page: Page) -> Optional[Any]:
-                    # 先尝试主页面
-                    try:
-                        # 等待页面加载完成
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                        if require_selector:
-                            page.wait_for_selector(item_selector, timeout=10000, state="attached")
-                        return callback(page)
-                    except Exception:
-                        if not require_selector:
-                            # 如果不需要选择器，直接返回主页面
-                            return callback(page)
-                        pass
-                    
-                    # 如果主页面没有，尝试所有frames
-                    if require_selector:
-                        frames = page.frames
-                        for candidate in frames:
-                            try:
-                                candidate.wait_for_selector(item_selector, timeout=5000, state="attached")
-                                return callback(candidate)
-                            except Exception:
-                                continue
-                        raise RuntimeError("未在任何 frame 中检测到商品列表。")
-                    else:
-                        # 不需要选择器时，返回主页面
-                        return callback(page)
-
-                return controller.perform(run)
+            pagination_status = _get_pagination_status()
+            total_pages = max(1, pagination_status.get("pageCount", 1))
+            current_page = pagination_status.get("currentPage", 1)
+            if total_pages > 1:
+                self._log(f"检测到分页，共 {total_pages} 页。将跳转到最后一页并将其视为倒序第 1 页。")
+                if current_page != total_pages:
+                    _go_to_last_page(total_pages)
+                    pagination_status = _get_pagination_status()
+                    current_page = pagination_status.get("currentPage", total_pages)
+                else:
+                    self._log("当前已在最后一页，将直接作为倒序第 1 页处理。")
+            else:
+                self._log("未检测到分页，当前页视为倒序第 1 页。")
+            page_sequence_label = 1
+            self._log(f"开始处理倒序第 {page_sequence_label} 页（原始页码 {current_page}/{total_pages}）。")
 
             # 先等待页面加载，不要求找到选择器
             try:
@@ -1077,29 +1216,71 @@ class MainWindow(tk.Tk):
             goods_count = count_result.get("valid", 0) if isinstance(count_result, dict) else (count_result or 0)
             total_count = count_result.get("total", 0) if isinstance(count_result, dict) else 0
             
-            if goods_count == 0:
-                self._log("当前页面未找到可讲解的商品，自动讲解结束。")
-                if total_count > 0:
-                    self._log(f"提示：选择器匹配到 {total_count} 个元素，但没有找到可讲解的商品。")
-                return
-
-            if total_count > goods_count:
-                self._log(f"选择器匹配到 {total_count} 个元素，过滤后找到 {goods_count} 个可讲解商品。")
-            self._log(f"共检测到 {goods_count} 个可讲解商品，开始依次处理。")
-
-            processed_count = 0
-            max_attempts = goods_count * 2  # 最多尝试次数，防止无限循环
-            attempt = 0
-            modal_handled = False  # 标记是否已经处理过模态框
-            processed_indices = set()  # 记录已处理过的商品索引，避免重复处理
-            processed_skus = set()  # 记录已处理过的商品SKU，避免重复处理
-            last_processed_index = -1  # 记录上次处理的商品索引
-            last_processed_sku = None  # 记录上次处理的商品SKU
-
-            while processed_count < goods_count and attempt < max_attempts:
-                attempt += 1
+            # 分页循环：从最后一页开始，逐页往前处理
+            while True:
                 if self.task_stop_event.is_set():
                     break
+                
+                # 重新统计当前页的商品数量
+                count_result = with_context(
+                    lambda ctx: ctx.evaluate(
+                        """
+                        (selector) => {
+                            const items = Array.from(document.querySelectorAll(selector));
+                            const totalCount = items.length;
+                            
+                            const validItems = items.filter(item => {
+                                const style = window.getComputedStyle(item);
+                                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                                    return false;
+                                }
+                                
+                                const buttons = Array.from(item.querySelectorAll('button, span, div, a'));
+                                const hasExplainButton = buttons.some(btn => {
+                                    const text = (btn.textContent || '').trim();
+                                    return text === '讲解' || (text.includes('讲解') && !text.includes('取消') && !text.includes('结束'));
+                                });
+                                
+                                return hasExplainButton;
+                            });
+                            
+                            return {
+                                total: totalCount,
+                                valid: validItems.length
+                            };
+                        }
+                        """,
+                        item_selector
+                    ),
+                    require_selector=False
+                ) or {"total": 0, "valid": 0}
+                
+                goods_count = count_result.get("valid", 0) if isinstance(count_result, dict) else (count_result or 0)
+                total_count = count_result.get("total", 0) if isinstance(count_result, dict) else 0
+                
+                if goods_count == 0:
+                    self._log(f"倒序第 {page_sequence_label} 页未找到可讲解的商品。")
+                    if total_count > 0:
+                        self._log(f"提示：选择器匹配到 {total_count} 个元素，但没有找到可讲解的商品。")
+                else:
+                    if total_count > goods_count:
+                        self._log(f"倒序第 {page_sequence_label} 页：选择器匹配到 {total_count} 个元素，过滤后找到 {goods_count} 个可讲解商品。")
+                    else:
+                        self._log(f"倒序第 {page_sequence_label} 页：共检测到 {goods_count} 个可讲解商品，开始依次处理。")
+
+                processed_count = 0
+                max_attempts = goods_count * 2  # 最多尝试次数，防止无限循环
+                attempt = 0
+                modal_handled = False  # 标记是否已经处理过模态框
+                processed_indices = set()  # 记录已处理过的商品索引，避免重复处理
+                processed_skus = set()  # 记录已处理过的商品SKU，避免重复处理
+                last_processed_index = -1  # 记录上次处理的商品索引
+                last_processed_sku = None  # 记录上次处理的商品SKU
+
+                while processed_count < goods_count and attempt < max_attempts:
+                    attempt += 1
+                    if self.task_stop_event.is_set():
+                        break
 
                 # 每次循环都重新查询商品列表，因为点击后页面可能变化
                 # 等待一下，确保页面状态已更新
@@ -2274,23 +2455,23 @@ class MainWindow(tk.Tk):
                                             // 获取当前商品项
                                             const items = Array.from(document.querySelectorAll(itemSelector));
                                             const currentItem = items[itemIndex];
-                                            
+                                        
                                             // 优先在当前商品项内查找
                                             if (currentItem) {
                                                 const itemSpans = Array.from(currentItem.querySelectorAll('span'));
                                                 for (const span of itemSpans) {
-                                                    const text = (span.textContent || '').trim();
-                                                    if (text === '结束') {
+                                                const text = (span.textContent || '').trim();
+                                                if (text === '结束') {
                                                         const rect = span.getBoundingClientRect();
                                                         if (rect.width > 0 && rect.height > 0) {
                                                             span.scrollIntoView({ behavior: 'smooth', block: 'center' });
                                                             setTimeout(() => span.click(), 100);
                                                             return { success: true, method: 'currentItem' };
-                                                        }
                                                     }
                                                 }
-                                            }
-                                            
+                                                }
+                                        }
+                                        
                                             // 在整个页面查找
                                             const allSpans = Array.from(document.querySelectorAll('span'));
                                             for (const span of allSpans) {
@@ -2330,28 +2511,28 @@ class MainWindow(tk.Tk):
                                 if stop_attempt == 0 or stop_attempt % 5 == 0:  # 每5次尝试记录一次
                                     self._log(f"查找停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）: {debug_msg}")
                                     
-                                    # 额外记录页面状态
-                                    try:
-                                        page_info = with_context(
-                                            lambda ctx: ctx.evaluate("""
-                                                () => {
-                                                    const allSpans = Array.from(document.querySelectorAll('span'));
-                                                    const endButtons = allSpans.filter(s => (s.textContent || '').trim() === '结束');
-                                                    return {
-                                                        totalEndButtons: endButtons.length,
-                                                        visibleEndButtons: endButtons.filter(s => {
-                                                            const rect = s.getBoundingClientRect();
-                                                            return rect.width > 0 && rect.height > 0;
-                                                        }).length
-                                                    };
-                                                }
+                                # 额外记录页面状态
+                                try:
+                                    page_info = with_context(
+                                        lambda ctx: ctx.evaluate("""
+                                            () => {
+                                                const allSpans = Array.from(document.querySelectorAll('span'));
+                                                const endButtons = allSpans.filter(s => (s.textContent || '').trim() === '结束');
+                                                return {
+                                                    totalEndButtons: endButtons.length,
+                                                    visibleEndButtons: endButtons.filter(s => {
+                                                        const rect = s.getBoundingClientRect();
+                                                        return rect.width > 0 && rect.height > 0;
+                                                    }).length
+                                                };
+                                            }
                                             """),
-                                            require_selector=False
-                                        )
-                                        if page_info:
-                                            self._log(f"  页面状态: 共找到 {page_info.get('totalEndButtons', 0)} 个'结束'按钮，其中 {page_info.get('visibleEndButtons', 0)} 个可见")
-                                    except Exception:
-                                        pass
+                                        require_selector=False
+                                    )
+                                    if page_info:
+                                        self._log(f"  页面状态: 共找到 {page_info.get('totalEndButtons', 0)} 个'结束'按钮，其中 {page_info.get('visibleEndButtons', 0)} 个可见")
+                                except Exception:
+                                    pass
                                     
                         except Exception as e:  # noqa: BLE001
                             if stop_attempt == 0 or stop_attempt % 5 == 0:
@@ -2416,6 +2597,44 @@ class MainWindow(tk.Tk):
                 # 重要：在下次循环开始前，再次等待一下，确保页面状态完全更新
                 # 这样重新查询商品列表时，第一个商品的状态应该已经更新（不再是"讲解"）
                 time.sleep(0.5)
+
+            # 当前页处理完成，尝试翻到上一页继续处理
+            if total_pages > 1:
+                pagination_status = _get_pagination_status()
+                prev_disabled = pagination_status.get("prevDisabled", True)
+                
+                if not prev_disabled:
+                    # 点击上一页
+                    prev_clicked = with_context(
+                        lambda ctx: ctx.evaluate("""
+                            () => {
+                                const prevBtn = document.querySelector('li.ant-pagination-prev button');
+                                if (prevBtn && !prevBtn.disabled) {
+                                    prevBtn.click();
+                                    return true;
+                                }
+                                return false;
+                            }
+                        """),
+                        require_selector=False
+                    )
+                    
+                    if prev_clicked:
+                        page_sequence_label += 1
+                        self._log(f"已点击上一页，开始处理倒序第 {page_sequence_label} 页。")
+                        # 等待页面加载
+                        try:
+                            with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                            time.sleep(2)  # 等待页面渲染
+                        except Exception:
+                            pass
+                        
+                        # 重新获取商品列表，继续处理
+                        continue
+                    else:
+                        self._log("上一页按钮不可用，已处理完所有页面。")
+                else:
+                    self._log("已到达第一页，所有页面处理完成。")
 
             if self.task_stop_event.is_set():
                 self._log("自动讲解任务已被手动停止。")
