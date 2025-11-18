@@ -553,6 +553,7 @@ class MainWindow(tk.Tk):
             # 建立商品编号到页面的映射：遍历所有页面，记录每页的商品编号
             item_index_to_page_map: Dict[int, int] = {}  # 商品编号 -> 页码
             page_to_item_indices_map: Dict[int, List[int]] = {}  # 页码 -> 商品编号列表（用于调试）
+            all_item_indices_sorted: List[int] = []  # 所有商品编号的升序列表，用于按顺序播放
             
             if total_pages > 1:
                 self._log(f"检测到分页，共 {total_pages} 页。开始遍历所有页面，建立商品编号映射...")
@@ -636,8 +637,12 @@ class MainWindow(tk.Tk):
                 else:
                     self._log("当前已在最后一页，将直接作为倒序第 1 页处理。")
                 
+                # 建立所有商品编号的升序列表
+                all_item_indices_sorted = sorted(item_index_to_page_map.keys())
                 self._log(f"商品编号映射建立完成，共记录 {len(item_index_to_page_map)} 个商品编号")
+                self._log(f"所有商品编号（升序）: {all_item_indices_sorted}")
                 logger.info("商品编号映射建立完成，共记录 {} 个商品编号", len(item_index_to_page_map))
+                logger.info("所有商品编号（升序）: {}", all_item_indices_sorted)
             else:
                 self._log("未检测到分页，当前页视为倒序第 1 页。")
                 # 单页情况下，也建立映射
@@ -676,6 +681,10 @@ class MainWindow(tk.Tk):
                             pass
                 
                 page_to_item_indices_map[1] = sorted([int(idx) if isinstance(idx, str) else int(idx) for idx in current_items if idx is not None])
+                # 建立所有商品编号的升序列表
+                all_item_indices_sorted = sorted(item_index_to_page_map.keys())
+                self._log(f"所有商品编号（升序）: {all_item_indices_sorted}")
+                logger.info("所有商品编号（升序）: {}", all_item_indices_sorted)
             
             page_sequence_label = 1
             self._log(f"开始处理倒序第 {page_sequence_label} 页（原始页码 {current_page}/{total_pages}）。")
@@ -1336,6 +1345,7 @@ class MainWindow(tk.Tk):
             
             # 初始化跨页面的商品编号跟踪变量（需要在分页循环外部初始化，避免每次进入新页时重置）
             last_processed_item_index = None  # 记录上次处理的商品编号（itemIndex），跨页面保持
+            current_item_index_position = 0  # 当前处理位置在 all_item_indices_sorted 中的索引
             
             # 分页循环：从最后一页开始，逐页往前处理
             while True:
@@ -1696,151 +1706,133 @@ class MainWindow(tk.Tk):
                     is_sku_processed = sku in processed_skus
                     self._log(f"  商品编号 {item_index} (DOM索引 {idx}): SKU='{sku}', 按钮文本='{btn_text}', 已处理={is_proc}, 索引已记录={is_in_processed}, SKU已记录={is_sku_processed}")
                 
-                # 如果知道上一个处理的商品编号，优先从编号+1开始查找
-                if last_processed_item_index is not None:
-                    # 尝试将商品编号转换为数字进行比较
-                    try:
-                        self._log(f"上一个处理的商品编号（原始值）: {last_processed_item_index} (类型: {type(last_processed_item_index).__name__})")
-                        logger.info("上一个处理的商品编号（原始值）: {} (类型: {})", last_processed_item_index, type(last_processed_item_index).__name__)
-                        if isinstance(last_processed_item_index, str):
-                            last_num = int(last_processed_item_index)
-                        else:
-                            last_num = int(last_processed_item_index)
+                # 按照 all_item_indices_sorted 列表的顺序播放
+                if all_item_indices_sorted and current_item_index_position < len(all_item_indices_sorted):
+                    # 获取下一个要处理的商品编号
+                    target_item_num = all_item_indices_sorted[current_item_index_position]
+                    self._log(f"按照编号列表顺序播放，下一个商品编号: {target_item_num} (位置: {current_item_index_position + 1}/{len(all_item_indices_sorted)})")
+                    logger.info("按照编号列表顺序播放，下一个商品编号: {} (位置: {}/{})", target_item_num, current_item_index_position + 1, len(all_item_indices_sorted))
+                    
+                    # 使用映射查找目标编号所在的页面
+                    target_page = item_index_to_page_map.get(target_item_num)
+                    
+                    if target_page is not None:
+                        # 获取当前页码
+                        pagination_status = _get_pagination_status()
+                        current_page = pagination_status.get("currentPage", 1)
                         
-                        self._log(f"上一个处理的商品编号: {last_num}，优先查找编号 {last_num + 1} 的商品")
-                        logger.info("上一个处理的商品编号: {}，优先查找编号 {} 的商品", last_num, last_num + 1)
+                        # 如果目标编号在其他页面，先跳转到该页面
+                        if current_page != target_page:
+                            self._log(f"编号 {target_item_num} 在第 {target_page} 页，当前在第 {current_page} 页，跳转到第 {target_page} 页")
+                            logger.info("编号 {} 在第 {} 页，当前在第 {} 页，跳转到第 {} 页", target_item_num, target_page, current_page, target_page)
+                            
+                            # 跳转到目标页面
+                            if _go_to_page(target_page):
+                                # 等待页面加载
+                                try:
+                                    with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                                    time.sleep(2)  # 等待商品列表渲染
+                                except Exception:
+                                    pass
+                                
+                                # 更新当前页码
+                                pagination_status = _get_pagination_status()
+                                current_page = pagination_status.get("currentPage", target_page)
+                                
+                                # 跳转页面后，重新开始整个查找循环（会重新获取完整的商品列表）
+                                continue  # 跳出当前循环，重新开始查找（会重新获取 current_items）
+                            else:
+                                self._log(f"跳转到第 {target_page} 页失败，跳过编号 {target_item_num}，尝试下一个编号")
+                                logger.warning("跳转到第 {} 页失败，跳过编号 {}，尝试下一个编号", target_page, target_item_num)
+                                current_item_index_position += 1  # 跳过当前编号，继续下一个
+                                continue  # 重新开始查找
                         
-                        # 首先尝试查找编号为 last_num + 1 的商品
-                        # 先输出当前页所有商品的编号，用于调试
-                        available_item_nums = []
+                        # 如果目标编号在当前页，在当前页查找
+                        found_target_num = False  # 标记是否找到了该编号的商品
                         for item_info in current_items:
+                            index = item_info.get("index", 0)
+                            button_text = item_info.get("buttonText", "").strip()
+                            sku = item_info.get("sku", "")
                             item_index = item_info.get("itemIndex")
+                            
+                            # 尝试将商品编号转换为数字进行比较
+                            item_num = None
                             if item_index is not None:
                                 try:
                                     if isinstance(item_index, str):
-                                        num = int(item_index)
+                                        item_num = int(item_index)
                                     else:
-                                        num = int(item_index)
-                                    available_item_nums.append(num)
+                                        item_num = int(item_index)
                                 except (ValueError, TypeError):
                                     pass
-                        self._log(f"当前页可用的商品编号列表: {sorted(available_item_nums)}")
-                        logger.info("当前页可用的商品编号列表: {}", sorted(available_item_nums))
-                        
-                        for offset in range(1, 10):  # 最多尝试+9，避免无限循环
-                            target_num = last_num + offset
-                            self._log(f"尝试查找编号 {target_num} 的商品...")
-                            logger.info("尝试查找编号 {} 的商品...", target_num)
                             
-                            found_target_num = False  # 标记是否找到了该编号的商品
-                            for item_info in current_items:
-                                index = item_info.get("index", 0)
-                                button_text = item_info.get("buttonText", "").strip()
-                                sku = item_info.get("sku", "")
-                                item_index = item_info.get("itemIndex")
+                            # 如果编号匹配
+                            if item_num == target_item_num:
+                                self._log(f"  找到匹配编号的商品: 原始编号={item_index} (类型={type(item_index).__name__}), 转换后={item_num}, 目标编号={target_item_num}")
+                                logger.info("找到匹配编号的商品: 原始编号={} (类型={}), 转换后={}, 目标编号={}", item_index, type(item_index).__name__, item_num, target_item_num)
+                                found_target_num = True  # 找到了该编号的商品
+                                # 检查是否已处理
+                                if sku and sku in processed_skus:
+                                    self._log(f"跳过商品编号 {target_item_num} (SKU: {sku})：SKU已在已处理列表中")
+                                    break  # 跳出内层循环，尝试下一个编号
                                 
-                                # 尝试将商品编号转换为数字进行比较
-                                item_num = None
-                                if item_index is not None:
-                                    try:
-                                        if isinstance(item_index, str):
-                                            item_num = int(item_index)
-                                        else:
-                                            item_num = int(item_index)
-                                    except (ValueError, TypeError):
-                                        pass
+                                if index in processed_indices:
+                                    self._log(f"跳过商品编号 {target_item_num}：索引已在已处理列表中")
+                                    break
                                 
-                                # 如果编号匹配
-                                if item_num == target_num:
-                                    self._log(f"  找到匹配编号的商品: 原始编号={item_index} (类型={type(item_index).__name__}), 转换后={item_num}, 目标编号={target_num}")
-                                    logger.info("找到匹配编号的商品: 原始编号={} (类型={}), 转换后={}, 目标编号={}", item_index, type(item_index).__name__, item_num, target_num)
-                                    found_target_num = True  # 找到了该编号的商品
-                                    # 检查是否已处理
-                                    if sku and sku in processed_skus:
-                                        self._log(f"跳过商品编号 {target_num} (SKU: {sku})：SKU已在已处理列表中")
-                                        break  # 跳出内层循环，尝试下一个编号
-                                    
-                                    if index in processed_indices:
-                                        self._log(f"跳过商品编号 {target_num}：索引已在已处理列表中")
-                                        break
-                                    
-                                    if sku and sku == last_processed_sku:
-                                        self._log(f"跳过商品编号 {target_num} (SKU: {sku})：这是上次处理的商品")
-                                        break
-                                    
-                                    if index == last_processed_index:
-                                        self._log(f"跳过商品编号 {target_num}：这是上次处理的商品（索引）")
-                                        break
-                                    
-                                    # 检查按钮文本
-                                    if button_text == "讲解":
+                                if sku and sku == last_processed_sku:
+                                    self._log(f"跳过商品编号 {target_item_num} (SKU: {sku})：这是上次处理的商品")
+                                    break
+                                
+                                if index == last_processed_index:
+                                    self._log(f"跳过商品编号 {target_item_num}：这是上次处理的商品（索引）")
+                                    break
+                                
+                                # 检查按钮文本
+                                if button_text == "讲解":
+                                    next_item = item_info
+                                    self._log(f"找到目标商品：编号 {target_item_num}, DOM索引 {index}, SKU: {sku}")
+                                    logger.info("找到目标商品：编号 {}, DOM索引 {}, SKU: {}", target_item_num, index, sku)
+                                    break
+                                elif button_text and "讲解" in button_text:
+                                    if "取消" not in button_text and "结束" not in button_text:
                                         next_item = item_info
-                                        self._log(f"找到目标商品：编号 {target_num}, DOM索引 {index}, SKU: {sku}")
-                                        logger.info("找到目标商品：编号 {}, DOM索引 {}, SKU: {}", target_num, index, sku)
+                                        self._log(f"找到目标商品：编号 {target_item_num}, DOM索引 {index}, SKU: {sku}")
                                         break
-                                    elif button_text and "讲解" in button_text:
-                                        if "取消" not in button_text and "结束" not in button_text:
-                                            next_item = item_info
-                                            self._log(f"找到目标商品：编号 {target_num}, DOM索引 {index}, SKU: {sku}")
-                                            break
-                                    
-                                    # 如果找到了匹配编号的商品，但按钮文本不符合条件，继续尝试下一个编号
-                                    if not next_item:
-                                        self._log(f"编号 {target_num} 的商品按钮文本不符合条件（'{button_text}'），尝试下一个编号")
-                                        break
-                            
-                            if next_item:
-                                break  # 找到了目标商品，跳出外层循环
-                            
-                            # 如果当前编号的商品不存在或已处理，尝试下一个编号
-                            if not found_target_num:
-                                self._log(f"编号 {target_num} 的商品不存在，尝试编号 {target_num + 1}")
-                            elif not next_item:
-                                self._log(f"编号 {target_num} 的商品已处理或不符合条件，尝试编号 {target_num + 1}")
+                                
+                                # 如果找到了匹配编号的商品，但按钮文本不符合条件，跳过该编号
+                                if not next_item:
+                                    self._log(f"编号 {target_item_num} 的商品按钮文本不符合条件（'{button_text}'），跳过该编号，尝试下一个")
+                                    break
                         
                         if next_item:
-                            self._log(f"成功找到目标商品编号 {target_num}")
-                            logger.info("成功找到目标商品编号 {}", target_num)
+                            self._log(f"成功找到目标商品编号 {target_item_num}")
+                            logger.info("成功找到目标商品编号 {}", target_item_num)
                         else:
-                            # 使用映射查找目标编号所在的页面，直接跳转
-                            target_item_num = last_num + 1
-                            target_page = item_index_to_page_map.get(target_item_num)
-                            
-                            if target_page is not None:
-                                # 检查当前是否已经在目标页面
-                                pagination_status = _get_pagination_status()
-                                current_page = pagination_status.get("currentPage", 1)
-                                
-                                if current_page != target_page:
-                                    self._log(f"编号 {target_item_num} 在第 {target_page} 页，当前在第 {current_page} 页，跳转到第 {target_page} 页")
-                                    logger.info("编号 {} 在第 {} 页，当前在第 {} 页，跳转到第 {} 页", target_item_num, target_page, current_page, target_page)
-                                    
-                                    # 跳转到目标页面
-                                    if _go_to_page(target_page):
-                                        # 等待页面加载
-                                        try:
-                                            with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
-                                            time.sleep(2)  # 等待商品列表渲染
-                                        except Exception:
-                                            pass
-                                        
-                                        # 更新当前页码
-                                        pagination_status = _get_pagination_status()
-                                        current_page = pagination_status.get("currentPage", target_page)
-                                        
-                                        # 重新获取商品列表，继续查找目标编号
-                                        continue  # 跳出当前循环，重新开始查找
-                                    else:
-                                        self._log(f"跳转到第 {target_page} 页失败，回退到查找第一个可讲解的商品")
-                                        logger.warning("跳转到第 {} 页失败", target_page)
-                                else:
-                                    self._log(f"编号 {target_item_num} 在第 {target_page} 页，当前已在第 {target_page} 页，但未找到该商品，可能已被删除")
-                                    logger.warning("编号 {} 在第 {} 页，当前已在第 {} 页，但未找到该商品，可能已被删除", target_item_num, target_page, target_page)
+                            # 如果当前编号的商品不存在或已处理，跳过该编号，继续下一个
+                            if not found_target_num:
+                                self._log(f"编号 {target_item_num} 在当前页未找到（可能已被删除），跳过该编号，尝试下一个")
+                                logger.warning("编号 {} 在当前页未找到（可能已被删除），跳过该编号，尝试下一个", target_item_num)
                             else:
-                                self._log(f"未找到编号 {target_item_num} 的页面映射（当前页商品编号: {sorted(available_item_nums) if available_item_nums else '无'}），回退到查找第一个可讲解的商品")
-                                logger.info("未找到编号 {} 的页面映射（当前页商品编号: {}），回退到查找第一个可讲解的商品", target_item_num, sorted(available_item_nums) if available_item_nums else '无')
-                    except (ValueError, TypeError):
-                        self._log(f"无法将商品编号转换为数字进行比较，回退到查找第一个可讲解的商品")
+                                self._log(f"编号 {target_item_num} 的商品已处理或不符合条件，跳过该编号，尝试下一个")
+                            
+                            # 移动到下一个编号
+                            current_item_index_position += 1
+                            continue  # 重新开始查找
+                    else:
+                        # 映射中没有该编号，跳过该编号，继续下一个
+                        self._log(f"编号 {target_item_num} 不在映射中（可能已被删除），跳过该编号，尝试下一个")
+                        logger.warning("编号 {} 不在映射中（可能已被删除），跳过该编号，尝试下一个", target_item_num)
+                        current_item_index_position += 1
+                        continue  # 重新开始查找
+                else:
+                    # 如果已经处理完所有编号，回退到查找第一个可讲解的商品
+                    if all_item_indices_sorted:
+                        self._log(f"已处理完所有编号列表中的商品（共 {len(all_item_indices_sorted)} 个），回退到查找第一个可讲解的商品")
+                        logger.info("已处理完所有编号列表中的商品（共 {} 个），回退到查找第一个可讲解的商品", len(all_item_indices_sorted))
+                    else:
+                        self._log("编号列表为空，回退到查找第一个可讲解的商品")
+                        logger.info("编号列表为空，回退到查找第一个可讲解的商品")
                 
                 # 如果没有找到目标商品，回退到原来的逻辑：查找第一个可讲解的商品
                 if not next_item:
@@ -2868,12 +2860,44 @@ class MainWindow(tk.Tk):
                             last_processed_item_index = int(item_index)
                         self._log(f"已记录商品编号: {last_processed_item_index}")
                         logger.info("已记录商品编号: {}", last_processed_item_index)
+                        
+                        # 更新 current_item_index_position，移动到下一个编号
+                        # 在 all_item_indices_sorted 中找到当前编号的位置，然后移动到下一个
+                        if all_item_indices_sorted:
+                            try:
+                                item_num = int(item_index) if isinstance(item_index, str) else int(item_index)
+                                # 找到当前编号在列表中的位置
+                                if item_num in all_item_indices_sorted:
+                                    pos = all_item_indices_sorted.index(item_num)
+                                    current_item_index_position = pos + 1  # 移动到下一个位置
+                                    self._log(f"已更新编号位置: 从位置 {pos} 移动到 {current_item_index_position} (编号: {item_num} -> {all_item_indices_sorted[current_item_index_position] if current_item_index_position < len(all_item_indices_sorted) else '无'})")
+                                    logger.info("已更新编号位置: 从位置 {} 移动到 {} (编号: {} -> {})", pos, current_item_index_position, item_num, all_item_indices_sorted[current_item_index_position] if current_item_index_position < len(all_item_indices_sorted) else '无')
+                                else:
+                                    # 如果当前编号不在列表中，尝试找到下一个更大的编号
+                                    next_pos = 0
+                                    for i, num in enumerate(all_item_indices_sorted):
+                                        if num > item_num:
+                                            next_pos = i
+                                            break
+                                    else:
+                                        next_pos = len(all_item_indices_sorted)  # 如果没找到，说明已经处理完所有编号
+                                    current_item_index_position = next_pos
+                                    self._log(f"当前编号 {item_num} 不在列表中，移动到位置 {current_item_index_position}")
+                                    logger.info("当前编号 {} 不在列表中，移动到位置 {}", item_num, current_item_index_position)
+                            except (ValueError, TypeError, IndexError) as e:
+                                logger.debug("更新编号位置时发生异常: {}", e)
+                                # 如果出错，至少移动到下一个位置
+                                current_item_index_position += 1
                     else:
                         self._log("商品编号为空或无效，无法记录")
                         logger.info("商品编号为空或无效，无法记录")
+                        # 即使编号无效，也移动到下一个位置
+                        current_item_index_position += 1
                 except Exception as e:
                     logger.debug("记录商品编号时发生异常: {}", e)
                     last_processed_item_index = None
+                    # 即使出错，也移动到下一个位置
+                    current_item_index_position += 1
                 self._log(f"已记录商品（索引: {index}, SKU: {sku}, 编号: {last_processed_item_index}）到已处理列表（处理完成）")
                 logger.info("已记录商品（索引: {}, SKU: {}, 编号: {}）到已处理列表（处理完成）", index, sku, last_processed_item_index)
                 
