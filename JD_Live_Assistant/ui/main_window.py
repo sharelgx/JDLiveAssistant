@@ -553,8 +553,18 @@ class MainWindow(tk.Tk):
                 self._log(f"检测到分页，共 {total_pages} 页。将跳转到最后一页并将其视为倒序第 1 页。")
                 if current_page != total_pages:
                     _go_to_last_page(total_pages)
+                    # 跳转后额外等待，确保页面和商品列表完全加载
+                    self._log("等待最后一页加载完成...")
+                    try:
+                        with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                        time.sleep(2)  # 额外等待，确保React应用完全渲染商品列表
+                    except Exception:
+                        pass
                     pagination_status = _get_pagination_status()
                     current_page = pagination_status.get("currentPage", total_pages)
+                    self._log(f"已跳转到最后一页（页码 {current_page}/{total_pages}），等待商品列表加载...")
+                    # 再次等待，确保商品列表完全渲染
+                    time.sleep(2)
                 else:
                     self._log("当前已在最后一页，将直接作为倒序第 1 页处理。")
             else:
@@ -1021,7 +1031,7 @@ class MainWindow(tk.Tk):
                                                     const classParts = className.split(' ').filter(c => c && c.length > 0);
                                                     if (classParts.length > 0) {
                                                         // 使用第一个有意义的类名
-                                                        const selector = '.' + classParts[0].replace(/\s+/g, '.');
+                                                        const selector = '.' + classParts[0].replace(/[\\s]+/g, '.');
                                                         containers.push({
                                                             selector: selector,
                                                             className: className,
@@ -1412,7 +1422,7 @@ class MainWindow(tk.Tk):
                                 for (const el of allTextElements) {
                                     const text = el.textContent || '';
                                     // 查找包含"SKU:"或"SKU："的文本
-                                    const skuMatch = text.match(/SKU[：:]\s*(\\d+)/i);
+                                    const skuMatch = text.match(/SKU[：:][\\s]*(\\d+)/i);
                                     if (skuMatch && skuMatch[1]) {
                                         sku = skuMatch[1];
                                         break;
@@ -1559,6 +1569,7 @@ class MainWindow(tk.Tk):
                 self._log(f"查询商品列表，共 {len(current_items)} 个商品（已按编号升序排序）")
                 
                 # 输出所有商品的状态，用于调试
+                self._log("商品列表详情（按编号排序）：")
                 for item_info in current_items:
                     idx = item_info.get("index", -1)
                     item_index = item_info.get("itemIndex", "无编号")
@@ -1609,6 +1620,7 @@ class MainWindow(tk.Tk):
 
                 if not next_item:
                     self._log("所有商品都已处理完成或没有找到可讲解的商品。")
+                    # 跳出for循环，继续处理分页逻辑
                     break
 
                 index = next_item.get("index", 0)
@@ -2180,7 +2192,7 @@ class MainWindow(tk.Tk):
                                                 const popoverButtons = Array.from(popover.querySelectorAll('button'));
                                                 const confirmButton = popoverButtons.find((node) => {
                                                     // 获取按钮文本（包括内部span的文本）
-                                                    const text = (node.textContent || '').trim().replace(/\s+/g, '');
+                                                    const text = (node.textContent || '').trim().replace(/[\\s]+/g, '');
                                                     // 查找包含"确定"且是 primary 类型的按钮
                                                     return (text === "确定" || text.includes("确定")) && 
                                                            node.classList.contains('ant-btn-primary');
@@ -2216,7 +2228,7 @@ class MainWindow(tk.Tk):
                                             // 如果没找到popover，尝试查找所有包含"确定"的primary按钮
                                             const allButtons = Array.from(document.querySelectorAll('button.ant-btn-primary'));
                                             const confirmButton = allButtons.find((node) => {
-                                                const text = (node.textContent || '').trim().replace(/\s+/g, '');
+                                                const text = (node.textContent || '').trim().replace(/\\s+/g, '');
                                                 return text === "确定" || text.includes("确定");
                                             });
                                             
@@ -2598,15 +2610,15 @@ class MainWindow(tk.Tk):
                 # 这样重新查询商品列表时，第一个商品的状态应该已经更新（不再是"讲解"）
                 time.sleep(0.5)
 
-            # 当前页处理完成，尝试翻到上一页继续处理
-            if total_pages > 1:
-                pagination_status = _get_pagination_status()
-                prev_disabled = pagination_status.get("prevDisabled", True)
-                
-                if not prev_disabled:
-                    # 点击上一页
-                    prev_clicked = with_context(
-                        lambda ctx: ctx.evaluate("""
+                # 当前页处理完成，尝试翻到上一页继续处理
+                if total_pages > 1:
+                    pagination_status = _get_pagination_status()
+                    prev_disabled = pagination_status.get("prevDisabled", True)
+                    
+                    if not prev_disabled:
+                        # 点击上一页
+                        prev_clicked = with_context(
+                            lambda ctx: ctx.evaluate("""
                             () => {
                                 const prevBtn = document.querySelector('li.ant-pagination-prev button');
                                 if (prevBtn && !prevBtn.disabled) {
@@ -2636,10 +2648,10 @@ class MainWindow(tk.Tk):
                 else:
                     self._log("已到达第一页，所有页面处理完成。")
 
-            if self.task_stop_event.is_set():
-                self._log("自动讲解任务已被手动停止。")
-            else:
-                self._log("自动讲解任务已完成。")
+                if self.task_stop_event.is_set():
+                    self._log("自动讲解任务已被手动停止。")
+                else:
+                    self._log("自动讲解任务已完成。")
         finally:
             controller.disconnect()
             self.task_thread = None
