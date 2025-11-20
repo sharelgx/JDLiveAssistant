@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -17,10 +19,14 @@ from loguru import logger
 from playwright.sync_api import Page
 
 from JD_Live_Assistant.core.automation import BrowserController
+from JD_Live_Assistant.core.chrome_launcher import ChromeLauncher
 from JD_Live_Assistant.core.config import ConfigManager
 from JD_Live_Assistant.core.hotkeys import HotkeyManager
 from JD_Live_Assistant.core.license import LicenseError, LicenseManager
 from JD_Live_Assistant.core.schedule import ScheduleManager
+from JD_Live_Assistant.ui.page_interactor import PageInteractor
+from JD_Live_Assistant.ui.page_scripts import PageScripts
+from JD_Live_Assistant.ui.product_processor import ProductProcessor
 
 
 class MainWindow(tk.Tk):
@@ -45,6 +51,11 @@ class MainWindow(tk.Tk):
         self.config_manager = config_manager
         self.license_manager = license_manager
         self.config = self.config_manager.data
+        self.browser_config: Dict[str, Any] = self.config.setdefault("browser", {})
+        self.chrome_launcher = ChromeLauncher(
+            chrome_path=self.browser_config.get("chrome_path"),
+            profile_root=self.browser_config.get("profile_root") or None,
+        )
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.control_widgets: List[tk.Widget] = []
@@ -54,6 +65,9 @@ class MainWindow(tk.Tk):
         self.controls_enabled = True
 
         self._setup_variables()
+        self._ensure_browser_config()
+        self.port_var.trace_add("write", lambda *_: self._update_material_path_display())
+        self._update_material_path_display()
         self._build_ui()
         self._load_config()
         self._refresh_license_status()
@@ -70,15 +84,175 @@ class MainWindow(tk.Tk):
             {
                 "duration_seconds": 8,
                 "interval_seconds": 2,
-                "material_path": "",
             },
         )
         self.duration_var = tk.StringVar(value=str(task_config.get("duration_seconds", 8)))
         self.interval_var = tk.StringVar(value=str(task_config.get("interval_seconds", 2)))
-        self.material_path_var = tk.StringVar(value=task_config.get("material_path", ""))  # type: ignore[arg-type]
+        self.material_path_var = tk.StringVar(value="")
         self.license_var = tk.StringVar(value=license_info.key if license_info else "")
         self.license_status_var = tk.StringVar(value="未授权，功能已锁定")
         self.hotkey_summary_var = tk.StringVar(value="")
+        self.chrome_path_var = tk.StringVar(value=self._format_chrome_path())
+
+    def _ensure_browser_config(self) -> None:
+        """确保浏览器配置持久化。"""
+
+        updated = False
+        if self.chrome_launcher.executable and not self.browser_config.get("chrome_path"):
+            self.browser_config["chrome_path"] = str(self.chrome_launcher.executable)
+            updated = True
+
+        if not self.browser_config.get("profile_root"):
+            self.browser_config["profile_root"] = str(self.chrome_launcher.profile_root)
+            updated = True
+
+        if not isinstance(self.browser_config.get("port_profiles"), dict):
+            self.browser_config["port_profiles"] = {}
+            updated = True
+
+        if updated:
+            self.config_manager.save(self.config)
+
+        self.chrome_path_var.set(self._format_chrome_path())
+
+    def _format_chrome_path(self) -> str:
+        path = self.browser_config.get("chrome_path") or ""
+        if not path:
+            return "未检测到 Chrome，绑定时将提示"
+        return str(path)
+
+    def _material_base_dir(self) -> Path:
+        root = self.browser_config.get("profile_root")
+        if root:
+            try:
+                return Path(root)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("解析浏览器数据目录失败: {}", exc)
+        return self.chrome_launcher.profile_root
+
+    def _get_port_profiles(self) -> Dict[str, str]:
+        profiles = self.browser_config.setdefault("port_profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+            self.browser_config["port_profiles"] = profiles
+        return profiles
+
+    def _resolve_material_path_for_port(self, port: int, ensure_exists: bool = False) -> Path:
+        profiles = self._get_port_profiles()
+        profile_path = profiles.get(str(port))
+        if profile_path:
+            path = Path(profile_path)
+        else:
+            path = (self._material_base_dir() / str(port)).resolve()
+        if ensure_exists:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _get_material_directory(self, port: int) -> Path:
+        directory = self._resolve_material_path_for_port(port, ensure_exists=True)
+        self._set_material_path_text(str(directory))
+        return directory
+
+    def _update_material_path_display(self) -> None:
+        """更新素材路径显示。"""
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            self._set_material_path_text("端口未填写，待确定")
+            return
+        
+        # 如果已经绑定浏览器，使用已保存的配置
+        # 否则显示默认路径（不创建目录）
+        directory = self._resolve_material_path_for_port(port, ensure_exists=False)
+        self._set_material_path_text(str(directory))
+
+    def _set_material_path_text(self, value: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self.material_path_var.set(value)
+        else:
+            self.after(0, lambda v=value: self.material_path_var.set(v))
+
+    def _remember_port_profile(self, port: int, directory: Path) -> None:
+        profiles = self._get_port_profiles()
+        resolved = str(directory.resolve())
+        key = str(port)
+        if profiles.get(key) == resolved:
+            return
+        profiles[key] = resolved
+        self._set_material_path_text(resolved)
+        try:
+            self.config_manager.save(self.config)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("保存浏览器配置失败: {}", exc)
+
+    def _sync_port_profile(self, controller: BrowserController, port: int) -> None:
+        """同步端口配置：从已连接的浏览器获取 user-data-dir 并确定素材文件夹。"""
+        self._log("正在获取浏览器的 user-data-dir 参数...")
+        
+        # 方法1: 通过 CDP /json/version 获取
+        detected = self._detect_user_data_dir_via_port(port)
+        
+        # 方法2: 如果方法1失败，通过浏览器命令行参数获取
+        if not detected:
+            detected = self._detect_user_data_dir_from_browser(controller)
+        
+        if detected:
+            self._log(f"检测到浏览器的 user-data-dir: {detected}")
+            self._remember_port_profile(port, detected)
+            self._update_material_path_display()
+            self._log(f"素材文件夹已确定为: {detected}")
+        else:
+            # 如果无法检测到，使用默认路径
+            default_path = self._resolve_material_path_for_port(port, ensure_exists=True)
+            self._log(f"未能检测到浏览器的 user-data-dir，使用默认素材目录: {default_path}")
+            self._set_material_path_text(str(default_path))
+
+    def _detect_user_data_dir_via_port(self, port: int) -> Optional[Path]:
+        try:
+            with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3) as response:
+                payload = response.read().decode("utf-8", errors="ignore")
+            data = json.loads(payload)
+            user_data_dir = data.get("userDataDir") or data.get("userdatadir")
+            if user_data_dir:
+                return Path(user_data_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("通过端口获取 user-data-dir 失败: {}", exc)
+        return None
+
+    def _detect_user_data_dir_from_browser(self, controller: BrowserController) -> Optional[Path]:
+        try:
+            command_line = controller.perform(self._fetch_browser_command_line)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("获取浏览器命令行失败: {}", exc)
+            return None
+        if not command_line:
+            return None
+        return self._parse_user_data_dir_from_cmd(command_line)
+
+    @staticmethod
+    def _fetch_browser_command_line(page: Page) -> str:
+        session = page.context.new_cdp_session(page)
+        try:
+            version_info = session.send("Browser.getVersion")
+            return version_info.get("commandLine", "")
+        finally:
+            session.detach()
+
+    @staticmethod
+    def _parse_user_data_dir_from_cmd(command_line: str) -> Optional[Path]:
+        if not command_line:
+            return None
+        match = re.search(r'--user-data-dir=(?:"([^"]+)"|([^\s]+))', command_line)
+        if not match:
+            return None
+        path_str = match.group(1) or match.group(2)
+        if not path_str:
+            return None
+        try:
+            return Path(path_str)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("解析 user-data-dir 失败: {}", exc)
+            return None
 
     def _build_ui(self) -> None:
         main_frame = ttk.Frame(self, padding=16)
@@ -113,15 +287,16 @@ class MainWindow(tk.Tk):
         interval_entry = ttk.Entry(task_frame, textvariable=self.interval_var, width=12)
         interval_entry.grid(row=0, column=5, padx=(8, 16), sticky=tk.W)
 
-        ttk.Label(task_frame, text="卡点素材路径").grid(row=1, column=0, sticky=tk.E, pady=(12, 0))
-        material_entry = ttk.Entry(task_frame, textvariable=self.material_path_var)
-        material_entry.grid(row=1, column=1, columnspan=5, sticky=tk.EW, padx=(8, 16), pady=(12, 0))
+        ttk.Label(task_frame, text="素材目录（自动）").grid(row=1, column=0, sticky=tk.E, pady=(12, 0))
+        material_label = ttk.Label(task_frame, textvariable=self.material_path_var, foreground="#555555")
+        material_label.grid(row=1, column=1, columnspan=6, sticky=tk.W, padx=(8, 0), pady=(12, 0))
 
-        browse_material_btn = ttk.Button(task_frame, text="浏览", command=self._on_browse_material)
-        browse_material_btn.grid(row=1, column=6, sticky=tk.W, pady=(12, 0))
+        ttk.Label(task_frame, text="Chrome 路径").grid(row=2, column=0, sticky=tk.E, pady=(12, 0))
+        chrome_label = ttk.Label(task_frame, textvariable=self.chrome_path_var, foreground="#555555")
+        chrome_label.grid(row=2, column=1, columnspan=6, sticky=tk.W, padx=(8, 0), pady=(12, 0))
 
         button_column = ttk.Frame(task_frame)
-        button_column.grid(row=0, column=7, rowspan=2, sticky="ns", padx=(16, 0))
+        button_column.grid(row=0, column=7, rowspan=3, sticky="ns", padx=(16, 0))
 
         connect_btn = ttk.Button(button_column, text="绑定浏览器", command=self._on_connect)
         connect_btn.pack(fill=tk.X)
@@ -199,8 +374,6 @@ class MainWindow(tk.Tk):
                 port_entry,
                 duration_entry,
                 interval_entry,
-                material_entry,
-                browse_material_btn,
                 connect_btn,
                 disconnect_btn,
                 self.start_task_btn,
@@ -253,6 +426,7 @@ class MainWindow(tk.Tk):
         return value
 
     def _on_connect(self) -> None:
+        """绑定按钮点击事件：连接到用户手动打开的浏览器。"""
         if not self._ensure_license():
             return
         try:
@@ -263,14 +437,66 @@ class MainWindow(tk.Tk):
 
         def worker() -> None:
             try:
-                self.controller.connect(port)
-                self._log(f"绑定浏览器成功：端口 {port}")
+                self._log(f"开始绑定浏览器，端口: {port}")
+                self._log("提示：请确保已手动打开带参数的Chrome浏览器")
+                self._connect_browser(port)
+                # 绑定成功后，UI会自动更新素材路径
+                self.after(0, lambda: messagebox.showinfo("绑定成功", f"已成功绑定到端口 {port} 的浏览器\n素材文件夹已自动确定"))
+            except RuntimeError as exc:
+                logger.exception("绑定浏览器失败")
+                self._log(f"绑定失败：{exc}")
+                error_msg = f"无法连接到端口 {port} 的浏览器。\n\n请确保：\n1. 已手动打开带参数的Chrome浏览器\n2. Chrome启动命令包含 --remote-debugging-port={port}\n3. 端口号正确"
+                self.after(0, lambda e=error_msg: messagebox.showerror("绑定失败", e))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("绑定浏览器失败")
                 self._log(f"绑定失败：{exc}")
-                messagebox.showerror("绑定失败", str(exc))
+                self.after(0, lambda e=exc: messagebox.showerror("绑定失败", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _connect_browser(self, port: int) -> None:
+        """绑定浏览器：连接到已打开的浏览器并获取其属性参数。"""
+        self._connect_controller_instance(self.controller, port)
+
+    def _connect_controller_instance(self, controller: BrowserController, port: int) -> None:
+        """连接浏览器实例：仅连接已手动打开的浏览器，不自动启动。"""
+        # 直接连接，不自动启动浏览器（用户已手动打开带参数的Chrome浏览器）
+        controller.connect(port)
+        self._log(f"绑定浏览器成功：端口 {port}")
+
+        # 绑定成功后，获取浏览器的 user-data-dir 并确定素材文件夹
+        self._sync_port_profile(controller, port)
+
+    def _attempt_auto_launch(self, port: int) -> bool:
+        if not self.chrome_launcher:
+            return False
+
+        self._log("尝试自动启动 Chrome 并开启远程调试端口...")
+        try:
+            ready = self.chrome_launcher.launch_if_needed(port)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("自动启动 Chrome 失败")
+            self._log(f"自动启动 Chrome 失败：{exc}")
+            return False
+
+        if not ready:
+            self._log("Chrome 启动完成，但端口仍不可用。")
+            return False
+
+        if self.chrome_launcher.last_profile_dir:
+            self._remember_port_profile(port, self.chrome_launcher.last_profile_dir)
+            self._update_material_path_display()
+
+        # 更新缓存的路径信息
+        if self.chrome_launcher.executable:
+            path_value = str(self.chrome_launcher.executable)
+            if self.browser_config.get("chrome_path") != path_value:
+                self.browser_config["chrome_path"] = path_value
+                self.config_manager.save(self.config)
+            self.chrome_path_var.set(self._format_chrome_path())
+
+        self._log("Chrome 已启动，准备重新绑定。")
+        return True
 
     def _on_disconnect(self) -> None:
         self.controller.disconnect()
@@ -319,15 +545,14 @@ class MainWindow(tk.Tk):
         if interval is None:
             return
 
-        material_path = self.material_path_var.get().strip()
-        if not material_path:
-            messagebox.showwarning("缺少素材", "请先选择卡点素材路径。")
+        try:
+            port = int(self.port_var.get())
+        except ValueError:
+            messagebox.showerror("输入错误", "端口必须为整数。")
             return
 
-        directory = Path(material_path).expanduser().resolve()
-        if not directory.is_dir():
-            messagebox.showerror("路径无效", "请选择有效的素材文件夹。")
-            return
+        directory = self._get_material_directory(port)
+        self._log(f"素材目录：{directory}")
 
         if not self.controller.is_connected:
             proceed = messagebox.askyesno("未绑定浏览器", "当前未绑定浏览器，是否仅记录日志继续执行？")
@@ -337,15 +562,8 @@ class MainWindow(tk.Tk):
         task_config = self.config.setdefault("task", {})
         task_config["duration_seconds"] = duration
         task_config["interval_seconds"] = interval
-        task_config["material_path"] = str(directory)
 
         self.task_stop_event.clear()
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            messagebox.showerror("输入错误", "端口必须为整数。")
-            return
-
         self.task_thread = threading.Thread(
             target=self._task_worker,
             args=(directory, duration, interval, port),
@@ -371,163 +589,114 @@ class MainWindow(tk.Tk):
         self.controller.disconnect()
         self._log("任务已停止，并已断开浏览器连接。")
 
-    def _task_worker(self, directory: Path, duration: float, interval: float, port: int) -> None:
-        controller = BrowserController()
-        # 商品项选择器 - 支持新的表格结构
-        # 新结构：商品在 <tr class="ant-table-row"> 中，容器是 skuContainer
-        # 旧结构：商品在 div.wrapper 中
-        item_selector = "tr.ant-table-row, div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-skuContainer, div.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-wrapper"
-        # 图片选择器 - 优先使用特定类名，如果没有则回退到通用img
-        image_selector = "img.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-img"
-        # 按钮选择器 - 查找包含"讲解"文本的按钮
-        button_selector = ".antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn"
+    def _count_products(self, interactor: PageInteractor, item_selector: str) -> Dict[str, int]:
+        """
+        统计当前页的商品数量。
 
-        def with_context(callback: Callable[[Page], Optional[Any]], require_selector: bool = True) -> Optional[Any]:
-            def run(page: Page) -> Optional[Any]:
-                # 先尝试主页面
-                try:
-                    # 等待页面加载完成
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                    if require_selector:
-                        page.wait_for_selector(item_selector, timeout=10000, state="attached")
-                    return callback(page)
-                except Exception:
-                    if not require_selector:
-                        # 如果不需要选择器，直接返回主页面
-                        return callback(page)
-                    pass
-                
-                # 如果主页面没有，尝试所有frames
-                if require_selector:
-                    frames = page.frames
-                    for candidate in frames:
-                        try:
-                            candidate.wait_for_selector(item_selector, timeout=5000, state="attached")
-                            return callback(candidate)
-                        except Exception:
-                            continue
-                    raise RuntimeError("未在任何 frame 中检测到商品列表。")
-                else:
-                    # 不需要选择器时，返回主页面
-                    return callback(page)
+        Args:
+            interactor: 页面交互器
+            item_selector: 商品选择器
 
-            return controller.perform(run)
-
-        def _get_pagination_status() -> Dict[str, Any]:
-            """获取分页状态信息。"""
-
-            result = with_context(
+        Returns:
+            包含 total 和 valid 的字典
+        """
+        count_result = interactor.with_context(
                 lambda ctx: ctx.evaluate(
                     """
-                    () => {
-                        const pagination = document.querySelector('.ant-pagination');
-                        if (!pagination) {
-                            return {
-                                hasPagination: false,
-                                pageCount: 1,
-                                currentPage: 1,
-                                prevDisabled: true,
-                                nextDisabled: true,
-                            };
+                (selector) => {
+                    const items = Array.from(document.querySelectorAll(selector));
+                    const totalCount = items.length;
+                    
+                    const validItems = items.filter(item => {
+                        const style = window.getComputedStyle(item);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                            return false;
                         }
-
-                        const pageItems = Array.from(pagination.querySelectorAll('li.ant-pagination-item'));
-                        const pageNumbers = pageItems
-                            .map((item) => {
-                                const anchor = item.querySelector('a');
-                                const text = anchor ? anchor.textContent : item.textContent;
-                                return text ? parseInt(text.trim(), 10) : NaN;
-                            })
-                            .filter((num) => !Number.isNaN(num))
-                            .sort((a, b) => a - b);
-
-                        const activeItem = pagination.querySelector('li.ant-pagination-item-active');
-                        let currentPage = 1;
-                        if (activeItem) {
-                            const anchor = activeItem.querySelector('a');
-                            const text = anchor ? anchor.textContent : activeItem.textContent;
-                            if (text) {
-                                const parsed = parseInt(text.trim(), 10);
-                                if (!Number.isNaN(parsed)) {
-                                    currentPage = parsed;
-                                }
-                            }
-                        }
-
-                        const pageCount = pageNumbers.length > 0 ? Math.max(...pageNumbers) : 1;
-                        const prev = pagination.querySelector('li.ant-pagination-prev');
-                        const next = pagination.querySelector('li.ant-pagination-next');
-                        const prevDisabled = !!(prev && prev.classList.contains('ant-pagination-disabled'));
-                        const nextDisabled = !!(next && next.classList.contains('ant-pagination-disabled'));
+                        
+                        const buttons = Array.from(item.querySelectorAll('button, span, div, a'));
+                        const hasExplainButton = buttons.some(btn => {
+                            const text = (btn.textContent || '').trim();
+                            return text === '讲解' || (text.includes('讲解') && !text.includes('取消') && !text.includes('结束'));
+                        });
+                        
+                        return hasExplainButton;
+                    });
 
                         return {
-                            hasPagination: pageCount > 1,
-                            pageCount,
-                            currentPage,
-                            prevDisabled,
-                            nextDisabled,
-                        };
-                    }
-                    """
-                ),
-                require_selector=False,
-            )
-
-            if not result:
-                return {
-                    "hasPagination": False,
-                    "pageCount": 1,
-                    "currentPage": 1,
-                    "prevDisabled": True,
-                    "nextDisabled": True,
+                        total: totalCount,
+                        valid: validItems.length
+                    };
                 }
-            return result
+                """,
+                item_selector
+            ),
+            require_selector=False
+        ) or {"total": 0, "valid": 0}
+        
+        return {
+            "total": count_result.get("total", 0) if isinstance(count_result, dict) else 0,
+            "valid": count_result.get("valid", 0) if isinstance(count_result, dict) else (count_result or 0)
+        }
+
+    def _navigate_to_next_page(self, interactor: PageInteractor, current_page: int, total_pages: int) -> tuple[bool, int]:
+        """
+        翻到下一页。
+
+        Args:
+            interactor: 页面交互器
+            current_page: 当前页码
+            total_pages: 总页数
+
+        Returns:
+            (是否成功, 新页码)
+        """
+        if current_page >= total_pages:
+            return False, current_page
+        
+        pagination_status = interactor.get_pagination_status()
+        next_disabled = pagination_status.get("nextDisabled", True)
+        
+        if next_disabled:
+            return False, current_page
+        
+        # 点击下一页
+        next_clicked = interactor.click_next_page()
+        
+        if not next_clicked:
+            return False, current_page
+        
+        new_page = current_page + 1
+        self._log(f"已点击下一页，开始处理第 {new_page} 页（共 {total_pages} 页）。")
+        logger.info("已点击下一页，开始处理第 {} 页（共 {} 页）", new_page, total_pages)
+        
+        # 等待页面加载
+        try:
+            interactor.with_context(
+                lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000),
+                require_selector=False
+            )
+            time.sleep(2)  # 等待页面渲染
+        except Exception:
+            pass
+        
+        return True, new_page
+
+    def _task_worker(self, directory: Path, duration: float, interval: float, port: int) -> None:
+        controller = BrowserController()
+        # 使用封装的选择器
+        item_selector = PageScripts.ITEM_SELECTOR
+
+        # 创建页面交互器
+        interactor = PageInteractor(controller, item_selector)
 
         def _go_to_page(target_page: int) -> bool:
             """跳转到指定页码。"""
-
-            if target_page <= 0:
-                return False
-
-            clicked = with_context(
-                lambda ctx, tp=target_page: ctx.evaluate(
-                    """
-                    (targetPage) => {
-                        const direct = document.querySelector(`li.ant-pagination-item-${targetPage} a`);
-                        if (direct) {
-                            direct.click();
-                            return true;
-                        }
-                        const links = Array.from(document.querySelectorAll('li.ant-pagination-item a'));
-                        const target = links.find((link) => link.textContent && link.textContent.trim() === String(targetPage));
-                        if (target) {
-                            target.click();
-                            return true;
-                        }
-                        return false;
-                    }
-                    """,
-                    tp,
-                ),
-                require_selector=False,
-            )
-
-            if not clicked:
-                return False
-
-            try:
-                with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
-            except Exception:
-                pass
-            time.sleep(1)
-            return True
+            return interactor.go_to_page(target_page)
 
         def _go_to_last_page(page_count: int) -> bool:
             """跳转到最后一页。"""
-
             if page_count <= 1:
                 return False
-
             self._log(f"检测到分页，共 {page_count} 页，准备跳转到最后一页开始处理。")
             success = _go_to_page(page_count)
             if success:
@@ -538,7 +707,7 @@ class MainWindow(tk.Tk):
 
         try:
             try:
-                controller.connect(port)
+                self._connect_controller_instance(controller, port)
                 self._log(f"任务线程已连接浏览器：端口 {port}")
             except Exception as exc:  # noqa: BLE001
                 logger.exception("任务线程连接浏览器失败")
@@ -546,7 +715,7 @@ class MainWindow(tk.Tk):
                 self.after(0, lambda e=exc: messagebox.showerror("执行失败", str(e)))
                 return
 
-            pagination_status = _get_pagination_status()
+            pagination_status = interactor.get_pagination_status()
             total_pages = max(1, pagination_status.get("pageCount", 1))
             current_page = pagination_status.get("currentPage", 1)
             
@@ -560,11 +729,11 @@ class MainWindow(tk.Tk):
                     _go_to_page(1)
                     # 等待页面加载
                     try:
-                        with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                        interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
                         time.sleep(2)  # 等待商品列表渲染
                     except Exception:
                         pass
-                    pagination_status = _get_pagination_status()
+                    pagination_status = interactor.get_pagination_status()
                     current_page = pagination_status.get("currentPage", 1)
                     self._log(f"已跳转到第一页（页码 {current_page}/{total_pages}），等待商品列表加载...")
                     time.sleep(2)
@@ -580,7 +749,7 @@ class MainWindow(tk.Tk):
             try:
                 self._log("等待页面加载完成...")
                 # 等待页面加载状态
-                with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
                 # 额外等待，确保React应用完全渲染
                 time.sleep(3)
                 self._log("页面加载完成，开始查找商品列表...")
@@ -1098,7 +1267,7 @@ class MainWindow(tk.Tk):
                 logger.exception("等待讲解列表加载失败")
                 self._log("未检测到可讲解商品，尝试输出页面 HTML 片段用于诊断。")
                 try:
-                    snippet = with_context(lambda ctx: ctx.inner_html("body"), require_selector=False)
+                    snippet = interactor.with_context(lambda ctx: ctx.inner_html("body"), require_selector=False)
                     if snippet:
                         debug_path = directory / "debug-snippet.html"
                         try:
@@ -1185,50 +1354,9 @@ class MainWindow(tk.Tk):
             item_selector = found_selector
 
             # 只统计有"讲解"按钮的商品项，避免统计过多元素
-            # 使用 require_selector=False，因为我们已经找到了选择器，不需要再次等待
-            # 将选择器作为参数传递，避免在 f-string 中直接插入导致语法错误
-            count_result = with_context(
-                lambda ctx: ctx.evaluate(
-                    """
-                    (selector) => {
-                        const items = Array.from(document.querySelectorAll(selector));
-                        const totalCount = items.length;
-                        
-                        // 只统计有"讲解"按钮的商品，并且要求：
-                        // 1. 元素可见（不在隐藏状态）
-                        // 2. 有"讲解"按钮
-                        // 3. 按钮文本严格匹配"讲解"（排除"取消讲解"等）
-                        const validItems = items.filter(item => {
-                            // 检查元素是否可见
-                            const style = window.getComputedStyle(item);
-                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                                return false;
-                            }
-                            
-                            // 查找"讲解"按钮
-                            const buttons = Array.from(item.querySelectorAll('button, span, div, a'));
-                            const hasExplainButton = buttons.some(btn => {
-                                const text = (btn.textContent || '').trim();
-                                // 严格匹配：文本必须是"讲解"，不能包含"取消"、"结束"等
-                                return text === '讲解' || (text.includes('讲解') && !text.includes('取消') && !text.includes('结束'));
-                            });
-                            
-                            return hasExplainButton;
-                        });
-                        
-                        return {
-                            total: totalCount,
-                            valid: validItems.length
-                        };
-                    }
-                    """,
-                    item_selector
-                ),
-                require_selector=False
-            ) or {"total": 0, "valid": 0}
-            
-            goods_count = count_result.get("valid", 0) if isinstance(count_result, dict) else (count_result or 0)
-            total_count = count_result.get("total", 0) if isinstance(count_result, dict) else 0
+            count_result = self._count_products(interactor, item_selector)
+            goods_count = count_result["valid"]
+            total_count = count_result["total"]
             
             # 初始化跨页面的商品编号跟踪变量（需要在分页循环外部初始化，避免每次进入新页时重置）
             last_processed_item_index = None  # 记录上次处理的商品编号（itemIndex），跨页面保持
@@ -1239,41 +1367,9 @@ class MainWindow(tk.Tk):
                     break
                 
                 # 重新统计当前页的商品数量
-                count_result = with_context(
-                    lambda ctx: ctx.evaluate(
-                        """
-                        (selector) => {
-                            const items = Array.from(document.querySelectorAll(selector));
-                            const totalCount = items.length;
-                            
-                            const validItems = items.filter(item => {
-                                const style = window.getComputedStyle(item);
-                                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                                    return false;
-                                }
-                                
-                                const buttons = Array.from(item.querySelectorAll('button, span, div, a'));
-                                const hasExplainButton = buttons.some(btn => {
-                                    const text = (btn.textContent || '').trim();
-                                    return text === '讲解' || (text.includes('讲解') && !text.includes('取消') && !text.includes('结束'));
-                                });
-                                
-                                return hasExplainButton;
-                            });
-                            
-                            return {
-                                total: totalCount,
-                                valid: validItems.length
-                            };
-                        }
-                        """,
-                        item_selector
-                    ),
-                    require_selector=False
-                ) or {"total": 0, "valid": 0}
-                
-                goods_count = count_result.get("valid", 0) if isinstance(count_result, dict) else (count_result or 0)
-                total_count = count_result.get("total", 0) if isinstance(count_result, dict) else 0
+                count_result = self._count_products(interactor, item_selector)
+                goods_count = count_result["valid"]
+                total_count = count_result["total"]
                 
                 if goods_count == 0:
                     self._log(f"第 {current_page_num} 页未找到可讲解的商品。")
@@ -1284,40 +1380,9 @@ class MainWindow(tk.Tk):
                         self._log("第一页统计为0，等待3秒后重新统计...")
                         time.sleep(3)
                         # 重新统计一次
-                        count_result = with_context(
-                            lambda ctx: ctx.evaluate(
-                                """
-                                (selector) => {
-                                    const items = Array.from(document.querySelectorAll(selector));
-                                    const totalCount = items.length;
-                                    
-                                    const validItems = items.filter(item => {
-                                        const style = window.getComputedStyle(item);
-                                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                                            return false;
-                                        }
-                                        
-                                        const buttons = Array.from(item.querySelectorAll('button, span, div, a'));
-                                        const hasExplainButton = buttons.some(btn => {
-                                            const text = (btn.textContent || '').trim();
-                                            return text === '讲解' || (text.includes('讲解') && !text.includes('取消') && !text.includes('结束'));
-                                        });
-                                        
-                                        return hasExplainButton;
-                                    });
-                                    
-                                    return {
-                                        total: totalCount,
-                                        valid: validItems.length
-                                    };
-                                }
-                                """,
-                                item_selector
-                            ),
-                            require_selector=False
-                        ) or {"total": 0, "valid": 0}
-                        goods_count = count_result.get("valid", 0) if isinstance(count_result, dict) else (count_result or 0)
-                        total_count = count_result.get("total", 0) if isinstance(count_result, dict) else 0
+                        count_result = self._count_products(interactor, item_selector)
+                        goods_count = count_result["valid"]
+                        total_count = count_result["total"]
                         self._log(f"重新统计完成：共 {goods_count} 个可讲解商品（总数 {total_count}）")
                         logger.info("重新统计完成：共 {} 个可讲解商品", goods_count)
                 else:
@@ -1336,8 +1401,8 @@ class MainWindow(tk.Tk):
                 time.sleep(0.5)  # 等待页面稳定
                 
                 try:
-                    current_items = with_context(
-                        lambda ctx: ctx.evaluate(
+                    current_items = interactor.with_context(
+                    lambda ctx: ctx.evaluate(
                         """
                         ({ itemSelector, buttonSelector }) => {
                             const items = Array.from(document.querySelectorAll(itemSelector));
@@ -1581,7 +1646,7 @@ class MainWindow(tk.Tk):
                         time.sleep(2)
                         # 重新查询一次
                         try:
-                            current_items = with_context(
+                            current_items = interactor.with_context(
                                 lambda ctx: ctx.evaluate(
                                 """
                                 ({ itemSelector, buttonSelector }) => {
@@ -1777,48 +1842,48 @@ class MainWindow(tk.Tk):
                 
                 while current_item_index < len(current_items) and processed_count < goods_count:
                     if self.task_stop_event.is_set():
-                        break
+                                break
 
                     # 直接按列表下标获取下一个商品
                     self._log(f"从列表中获取商品：current_item_index={current_item_index}, 列表长度={len(current_items)}")
                     next_item = current_items[current_item_index]
                     current_item_index += 1  # 移动到下一个商品
 
-                    index = next_item.get("index", 0)
-                    item_index = next_item.get("itemIndex", "无编号")
-                    button_text = next_item.get("buttonText", "")
-                    sku = next_item.get("sku", "")
-                    
-                    self._log(f"✓ 获取到商品：准备处理第 {processed_count + 1} 个商品（列表下标 {current_item_index - 1}/{len(current_items)}，商品编号: {item_index}, DOM索引: {index}, SKU: {sku}, 按钮文本: '{button_text}'）")
-                    logger.info("准备处理商品：列表下标={}/{}, 编号={}, DOM索引={}, SKU={}, 按钮文本={}", current_item_index - 1, len(current_items), item_index, index, sku, button_text)
-                    
-                    # 跳过已经处理过的商品
-                    if sku and sku in processed_skus:
-                        self._log(f"跳过商品编号 {item_index} (SKU: {sku})：SKU已在已处理列表中")
+                index = next_item.get("index", 0)
+                item_index = next_item.get("itemIndex", "无编号")
+                button_text = next_item.get("buttonText", "")
+                sku = next_item.get("sku", "")
+                
+                self._log(f"✓ 获取到商品：准备处理第 {processed_count + 1} 个商品（列表下标 {current_item_index - 1}/{len(current_items)}，商品编号: {item_index}, DOM索引: {index}, SKU: {sku}, 按钮文本: '{button_text}'）")
+                logger.info("准备处理商品：列表下标={}/{}, 编号={}, DOM索引={}, SKU={}, 按钮文本={}", current_item_index - 1, len(current_items), item_index, index, sku, button_text)
+                
+                # 跳过已经处理过的商品
+                if sku and sku in processed_skus:
+                    self._log(f"跳过商品编号 {item_index} (SKU: {sku})：SKU已在已处理列表中")
+                    continue
+                
+                if index in processed_indices:
+                    self._log(f"跳过商品编号 {item_index}：索引已在已处理列表中")
+                    continue
+                
+                # 检查按钮文本
+                if button_text.strip() != "讲解":
+                    if "取消" in button_text or "结束" in button_text:
+                        self._log(f"跳过商品 {index}：按钮文本已改变（'{button_text}'），可能已处理过")
+                        processed_indices.add(index)
+                        processed_count += 1
                         continue
-                    
-                    if index in processed_indices:
-                        self._log(f"跳过商品编号 {item_index}：索引已在已处理列表中")
+                    elif "讲解" not in button_text:
+                        self._log(f"跳过商品 {index}：按钮文本不是'讲解'（'{button_text}'）")
+                        processed_indices.add(index)
+                        processed_count += 1
                         continue
-                    
-                    # 检查按钮文本
-                    if button_text.strip() != "讲解":
-                        if "取消" in button_text or "结束" in button_text:
-                            self._log(f"跳过商品 {index}：按钮文本已改变（'{button_text}'），可能已处理过")
-                            processed_indices.add(index)
-                            processed_count += 1
-                            continue
-                        elif "讲解" not in button_text:
-                            self._log(f"跳过商品 {index}：按钮文本不是'讲解'（'{button_text}'）")
-                            processed_indices.add(index)
-                            processed_count += 1
-                            continue
-                    
-                    # 处理商品（继续使用原有的处理逻辑）
-                    try:
-                        # 先下载图片
-                        info = with_context(
-                            lambda ctx, idx=index: ctx.evaluate(
+                
+                # 处理商品（继续使用原有的处理逻辑）
+                try:
+                    # 先下载图片
+                    info = interactor.with_context(
+                        lambda ctx, idx=index: ctx.evaluate(
                         """
                         ({ itemSelector, buttonSelector, imageSelector, index }) => {
                             const items = Array.from(document.querySelectorAll(itemSelector));
@@ -2033,49 +2098,65 @@ class MainWindow(tk.Tk):
                             "buttonSelector": button_selector,
                             "index": idx,
                         },
-                        )
                     )
-                        
-                        if not info:
-                            self._log(f"未能获取第 {processed_count + 1} 个商品信息，跳过。")
-                            processed_count += 1
-                            continue
+                )
+                except Exception as info_exc:  # noqa: BLE001
+                    logger.exception("获取商品信息失败")
+                    self._log(f"获取商品信息失败：{info_exc}")
+                    processed_indices.add(index)
+                    processed_count += 1
+                    continue
+                except Exception as item_exc:  # noqa: BLE001
+                    logger.exception("处理商品时发生异常")
+                    self._log(f"处理商品异常：{item_exc}")
+                    # 即使发生异常，也标记为已处理，避免重复处理
+                    processed_indices.add(index)
+                    if sku:
+                        processed_skus.add(sku)
+                    processed_count += 1
+                    continue
+                
+                # 继续处理商品（这部分代码在 try 块内）
+                if not info:
+                    self._log(f"未能获取第 {processed_count + 1} 个商品信息，跳过。")
+                    processed_count += 1
+                    continue
 
-                        title = info.get("title", f"商品 {index + 1}")
-                        self._log(f"获取商品信息：{title}")
-                        
-                        # 记录图片详细信息，用于调试
-                        image_alt = info.get("imageAlt", "")
-                        image_title = info.get("imageTitle", "")
-                        image_src = info.get("imageSrc", "")
-                        image_class_name = info.get("imageClassName", "")
-                        image_parent_text = info.get("imageParentText", "")
-                        
-                        self._log(f"图片详细信息：")
-                        self._log(f"  - alt: {image_alt}")
-                        self._log(f"  - title: {image_title}")
-                        self._log(f"  - src: {image_src}")
-                        self._log(f"  - className: {image_class_name}")
-                        self._log(f"  - 父元素文本: {image_parent_text}")
-                        
-                        # 尝试多种方式获取图片URL
-                        image_url = info.get("imageUrl") or info.get("imageDataSrc")
-                        
-                        # 如果没有直接URL，尝试从srcset中提取
-                        if not image_url:
-                            srcset = info.get("imageSrcset")
-                            if srcset:
-                                # srcset格式通常是 "url1 size1, url2 size2"，取第一个URL
-                                first_url = srcset.split(',')[0].strip().split()[0]
-                                if first_url:
-                                    image_url = first_url
-                        
-                        # 如果还是没有URL，尝试重新查找图片
-                        if not image_url:
-                            self._log("未从商品信息中获取到图片URL，尝试重新查找...")
-                            try:
-                                image_info = with_context(
-                                    lambda ctx, idx=index: ctx.evaluate(
+                title = info.get("title", f"商品 {index + 1}")
+                self._log(f"获取商品信息：{title}")
+                
+                # 记录图片详细信息，用于调试
+                image_alt = info.get("imageAlt", "")
+                image_title = info.get("imageTitle", "")
+                image_src = info.get("imageSrc", "")
+                image_class_name = info.get("imageClassName", "")
+                image_parent_text = info.get("imageParentText", "")
+                
+                self._log(f"图片详细信息：")
+                self._log(f"  - alt: {image_alt}")
+                self._log(f"  - title: {image_title}")
+                self._log(f"  - src: {image_src}")
+                self._log(f"  - className: {image_class_name}")
+                self._log(f"  - 父元素文本: {image_parent_text}")
+                
+                # 尝试多种方式获取图片URL
+                image_url = info.get("imageUrl") or info.get("imageDataSrc")
+                
+                # 如果没有直接URL，尝试从srcset中提取
+                if not image_url:
+                    srcset = info.get("imageSrcset")
+                    if srcset:
+                        # srcset格式通常是 "url1 size1, url2 size2"，取第一个URL
+                        first_url = srcset.split(',')[0].strip().split()[0]
+                        if first_url:
+                            image_url = first_url
+                
+                # 如果还是没有URL，尝试重新查找图片
+                if not image_url:
+                    self._log("未从商品信息中获取到图片URL，尝试重新查找...")
+                    try:
+                        image_info = interactor.with_context(
+                            lambda ctx, idx=index: ctx.evaluate(
                                 """
                                 ({ itemSelector, imageSelector, index }) => {
                                     const items = Array.from(document.querySelectorAll(itemSelector));
@@ -2163,75 +2244,75 @@ class MainWindow(tk.Tk):
                                 ),
                             )
                             
-                                if image_info:
-                                    image_url = image_info.get("imageUrl") or image_info.get("imageDataSrc")
-                                    if not image_url and image_info.get("imageSrcset"):
-                                        srcset = image_info.get("imageSrcset")
-                                        first_url = srcset.split(',')[0].strip().split()[0]
-                                        if first_url:
-                                            image_url = first_url
-                                    
-                                    # 记录重新查找的图片信息
-                                    if image_info.get("imageAlt"):
-                                        self._log(f"重新查找的图片alt: {image_info.get('imageAlt')}")
-                                    if image_info.get("imageParentText"):
-                                        self._log(f"重新查找的图片父元素文本: {image_info.get('imageParentText')}")
-                            except Exception as img_exc:  # noqa: BLE001
-                                logger.exception("重新查找图片时发生异常")
-                                self._log(f"重新查找图片异常：{img_exc}")
+                        if image_info:
+                            image_url = image_info.get("imageUrl") or image_info.get("imageDataSrc")
+                            if not image_url and image_info.get("imageSrcset"):
+                                srcset = image_info.get("imageSrcset")
+                                first_url = srcset.split(',')[0].strip().split()[0]
+                                if first_url:
+                                    image_url = first_url
+                            
+                            # 记录重新查找的图片信息
+                            if image_info.get("imageAlt"):
+                                self._log(f"重新查找的图片alt: {image_info.get('imageAlt')}")
+                            if image_info.get("imageParentText"):
+                                self._log(f"重新查找的图片父元素文本: {image_info.get('imageParentText')}")
+                    except Exception as img_exc:  # noqa: BLE001
+                        logger.exception("重新查找图片时发生异常")
+                        self._log(f"重新查找图片异常：{img_exc}")
 
-                        if not image_url:
-                            self._log(f"[{processed_count + 1}/{goods_count}] 未获取到图片URL，跳过下载。")
-                            self._log(f"图片信息：alt={image_alt}, title={image_title}, src={image_src}")
-                            processed_count += 1
-                            continue
-                        
-                        # 处理相对URL
-                        if not urlparse(image_url).netloc:
-                            # 获取当前页面URL作为基础URL
-                            base_url = with_context(lambda ctx: ctx.url) or "https://live.jd.com"
-                            image_url = urljoin(base_url, image_url)
-                        
-                        # 检查图片URL和alt属性，排除"AI手卡图片"等非商品图片
-                        image_alt_check = info.get("imageAlt", "")
-                        if image_alt_check:
-                            self._log(f"图片alt属性: {image_alt_check}")
-                            if 'AI' in image_alt_check and '手卡' in image_alt_check:
-                                self._log(f"警告：图片alt同时包含'AI'和'手卡'关键词，跳过下载：{image_alt_check}")
-                                processed_count += 1
-                                continue
-                        
-                        # 检查图片URL是否包含"AI"或"手卡"等关键词
-                        if 'AI' in image_url.upper() and ('手卡' in image_url or 'shouka' in image_url.lower() or 'aishouka' in image_url.lower()):
-                            self._log(f"警告：图片URL同时包含'AI'和'手卡'关键词，跳过下载：{image_url}")
-                            processed_count += 1
-                            continue
-                        
-                        # 检查父元素文本
-                        if image_parent_text and 'AI' in image_parent_text and '手卡' in image_parent_text:
-                            self._log(f"警告：图片父元素文本同时包含'AI'和'手卡'关键词，跳过下载：{image_parent_text}")
-                            processed_count += 1
-                            continue
-                        
-                        # 使用固定文件名 1.jpg，后面的图片会覆盖前面的
-                        destination = directory / "1.jpg"
-                        
-                        self._log(f"[{processed_count + 1}/{goods_count}] 开始下载图片：{title}")
-                        self._log(f"图片URL: {image_url}")
-                        self._log(f"保存路径: {destination}")
-                        if not self._download_image(image_url, destination):
-                            self._log(f"下载失败，跳过讲解：{title}")
-                            processed_count += 1
-                            continue
-                        self._log("下载完成。")
+                if not image_url:
+                    self._log(f"[{processed_count + 1}/{goods_count}] 未获取到图片URL，跳过下载。")
+                    self._log(f"图片信息：alt={image_alt}, title={image_title}, src={image_src}")
+                    processed_count += 1
+                    continue
+                
+                # 处理相对URL
+                if not urlparse(image_url).netloc:
+                    # 获取当前页面URL作为基础URL
+                    base_url = interactor.with_context(lambda ctx: ctx.url, require_selector=False) or "https://live.jd.com"
+                    image_url = urljoin(base_url, image_url)
+                
+                # 检查图片URL和alt属性，排除"AI手卡图片"等非商品图片
+                image_alt_check = info.get("imageAlt", "")
+                if image_alt_check:
+                    self._log(f"图片alt属性: {image_alt_check}")
+                    if 'AI' in image_alt_check and '手卡' in image_alt_check:
+                        self._log(f"警告：图片alt同时包含'AI'和'手卡'关键词，跳过下载：{image_alt_check}")
+                        processed_count += 1
+                        continue
+                
+                # 检查图片URL是否包含"AI"或"手卡"等关键词
+                if 'AI' in image_url.upper() and ('手卡' in image_url or 'shouka' in image_url.lower() or 'aishouka' in image_url.lower()):
+                    self._log(f"警告：图片URL同时包含'AI'和'手卡'关键词，跳过下载：{image_url}")
+                    processed_count += 1
+                    continue
+                
+                # 检查父元素文本
+                if image_parent_text and 'AI' in image_parent_text and '手卡' in image_parent_text:
+                    self._log(f"警告：图片父元素文本同时包含'AI'和'手卡'关键词，跳过下载：{image_parent_text}")
+                    processed_count += 1
+                    continue
+                
+                # 使用固定文件名 1.jpg，后面的图片会覆盖前面的
+                destination = directory / "1.jpg"
+                
+                self._log(f"[{processed_count + 1}/{goods_count}] 开始下载图片：{title}")
+                self._log(f"图片URL: {image_url}")
+                self._log(f"保存路径: {destination}")
+                if not self._download_image(image_url, destination):
+                    self._log(f"下载失败，跳过讲解：{title}")
+                    processed_count += 1
+                    continue
+                self._log("下载完成。")
 
-                        # 使用JavaScript查找并点击"讲解"按钮
-                        self._log(f"开始查找并点击讲解按钮（商品编号: {item_index}, DOM索引: {index}）...")
-                        logger.info("开始查找并点击讲解按钮：商品编号={}, DOM索引={}", item_index, index)
-                        clicked = False
-                        try:
-                            clicked = with_context(
-                                lambda ctx, idx=index: ctx.evaluate(
+                # 使用JavaScript查找并点击"讲解"按钮
+                self._log(f"开始查找并点击讲解按钮（商品编号: {item_index}, DOM索引: {index}）...")
+                logger.info("开始查找并点击讲解按钮：商品编号={}, DOM索引={}", item_index, index)
+                clicked = False
+                try:
+                    clicked = interactor.with_context(
+                        lambda ctx, idx=index: ctx.evaluate(
                             """
                             ({ itemSelector, buttonSelector, index }) => {
                                 const items = Array.from(document.querySelectorAll(itemSelector));
@@ -2327,36 +2408,36 @@ class MainWindow(tk.Tk):
                                 "buttonSelector": button_selector,
                                 "index": index,
                             },
-                                ),
-                                require_selector=False,
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            logger.exception("点击讲解按钮时发生异常")
-                            self._log(f"点击按钮异常：{exc}")
-                            clicked = False
+                        ),
+                        require_selector=False,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("点击讲解按钮时发生异常")
+                    self._log(f"点击按钮异常：{exc}")
+                    clicked = False
 
-                        if not clicked:
-                            self._log(f"❌ 未找到第 {processed_count + 1} 个商品的讲解按钮（商品编号: {item_index}, DOM索引: {index}），跳过。")
-                            logger.warning("未找到讲解按钮：商品编号={}, DOM索引={}", item_index, index)
-                            processed_indices.add(index)
-                            if sku:
-                                processed_skus.add(sku)
-                            processed_count += 1
-                            continue
+                if not clicked:
+                    self._log(f"❌ 未找到第 {processed_count + 1} 个商品的讲解按钮（商品编号: {item_index}, DOM索引: {index}），跳过。")
+                    logger.warning("未找到讲解按钮：商品编号={}, DOM索引={}", item_index, index)
+                    processed_indices.add(index)
+                    if sku:
+                        processed_skus.add(sku)
+                    processed_count += 1
+                    continue
 
-                        self._log(f"✓✓✓ 已点击讲解按钮：{title}（商品编号: {item_index}, DOM索引: {index}）")
-                        logger.info("已点击讲解按钮：{}, 商品编号={}, DOM索引={}", title, item_index, index)
-                        
-                        # 每次点击讲解按钮后都检查并处理确认弹窗（"该商品已关联/已上传讲解"等提示）
+                self._log(f"✓✓✓ 已点击讲解按钮：{title}（商品编号: {item_index}, DOM索引: {index}）")
+                logger.info("已点击讲解按钮：{}, 商品编号={}, DOM索引={}", title, item_index, index)
+                
+                # 每次点击讲解按钮后都检查并处理确认弹窗（"该商品已关联/已上传讲解"等提示）
+                try:
+                    self._log("检查是否需要确认（每次点击后都检查）...")
+                    # 等待模态框出现（最多等待3秒）
+                    modal_confirmed = False
+                    for wait_attempt in range(30):  # 30次，每次100ms，共3秒
+                        if self.task_stop_event.is_set():
+                            break
                         try:
-                            self._log("检查是否需要确认（每次点击后都检查）...")
-                            # 等待模态框出现（最多等待3秒）
-                            modal_confirmed = False
-                            for wait_attempt in range(30):  # 30次，每次100ms，共3秒
-                                if self.task_stop_event.is_set():
-                                    break
-                                try:
-                                    modal_confirmed = with_context(
+                            modal_confirmed = interactor.with_context(
                                     lambda ctx: ctx.evaluate(
                                         """
                                         () => {
@@ -2372,42 +2453,42 @@ class MainWindow(tk.Tk):
                                                                               popoverText.includes('确定讲解吗');
                                                     
                                                     if (hasConfirmMessage) {
-                                                const popoverButtons = Array.from(popover.querySelectorAll('button'));
-                                                const confirmButton = popoverButtons.find((node) => {
-                                                    // 获取按钮文本（包括内部span的文本）
-                                                    const text = (node.textContent || '').trim().replace(/[\\s]+/g, '');
-                                                    // 查找包含"确定"且是 primary 类型的按钮
-                                                    return (text === "确定" || text.includes("确定")) && 
-                                                           node.classList.contains('ant-btn-primary');
-                                                });
-                                                
-                                                if (confirmButton) {
-                                                    // 滚动到按钮位置
-                                                    confirmButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                                    // 等待一下
-                                                    const startTime = Date.now();
-                                                    while (Date.now() - startTime < 200) {}
-                                                    
-                                                    // 点击确定按钮
-                                                    try {
-                                                        confirmButton.click();
-                                                        return true;
-                                                    } catch (e) {
-                                                        try {
-                                                            const clickEvent = new MouseEvent('click', {
-                                                                bubbles: true,
-                                                                cancelable: true,
-                                                                view: window
-                                                            });
-                                                            confirmButton.dispatchEvent(clickEvent);
-                                                            return true;
-                                                        } catch (e2) {
-                                                            return false;
+                                                        const popoverButtons = Array.from(popover.querySelectorAll('button'));
+                                                        const confirmButton = popoverButtons.find((node) => {
+                                                            // 获取按钮文本（包括内部span的文本）
+                                                            const text = (node.textContent || '').trim().replace(/[\\s]+/g, '');
+                                                            // 查找包含"确定"且是 primary 类型的按钮
+                                                            return (text === "确定" || text.includes("确定")) && 
+                                                                   node.classList.contains('ant-btn-primary');
+                                                        });
+                                                        
+                                                        if (confirmButton) {
+                                                            // 滚动到按钮位置
+                                                            confirmButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                            // 等待一下
+                                                            const startTime = Date.now();
+                                                            while (Date.now() - startTime < 200) {}
+                                                            
+                                                            // 点击确定按钮
+                                                            try {
+                                                                confirmButton.click();
+                                                                return true;
+                                                            } catch (e) {
+                                                                try {
+                                                                    const clickEvent = new MouseEvent('click', {
+                                                                        bubbles: true,
+                                                                        cancelable: true,
+                                                                        view: window
+                                                                    });
+                                                                    confirmButton.dispatchEvent(clickEvent);
+                                                                    return true;
+                                                                } catch (e2) {
+                                                                    return false;
                                                                 }
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            }
                                             
                                             // 如果没找到popover，尝试查找所有包含"确定"的primary按钮
                                             const allButtons = Array.from(document.querySelectorAll('button.ant-btn-primary'));
@@ -2417,35 +2498,35 @@ class MainWindow(tk.Tk):
                                             });
                                             
                                             if (confirmButton) {
-                                                    // 检查按钮附近是否有确认消息
-                                                    const parent = confirmButton.closest('.ant-popover');
-                                                    if (parent) {
-                                                        const parentText = parent.textContent || '';
-                                                        const hasConfirmMessage = parentText.includes('该商品已关联') || 
-                                                                                  parentText.includes('已上传讲解') || 
-                                                                                  parentText.includes('覆盖已有切片') ||
-                                                                                  parentText.includes('确定讲解吗');
-                                                        if (hasConfirmMessage) {
-                                                confirmButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                                const startTime = Date.now();
-                                                while (Date.now() - startTime < 200) {}
-                                                
-                                                try {
-                                                    confirmButton.click();
-                                                    return true;
-                                                } catch (e) {
-                                                    try {
-                                                        const clickEvent = new MouseEvent('click', {
-                                                            bubbles: true,
-                                                            cancelable: true,
-                                                            view: window
-                                                        });
-                                                        confirmButton.dispatchEvent(clickEvent);
-                                                        return true;
-                                                    } catch (e2) {
-                                                        return false;
-                                                                }
+                                                // 检查按钮附近是否有确认消息
+                                                const parent = confirmButton.closest('.ant-popover');
+                                                if (parent) {
+                                                    const parentText = parent.textContent || '';
+                                                    const hasConfirmMessage = parentText.includes('该商品已关联') || 
+                                                                              parentText.includes('已上传讲解') || 
+                                                                              parentText.includes('覆盖已有切片') ||
+                                                                              parentText.includes('确定讲解吗');
+                                                    if (hasConfirmMessage) {
+                                                        confirmButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                                        const startTime = Date.now();
+                                                        while (Date.now() - startTime < 200) {}
+                                                        
+                                                        try {
+                                                            confirmButton.click();
+                                                            return true;
+                                                        } catch (e) {
+                                                            try {
+                                                                const clickEvent = new MouseEvent('click', {
+                                                                    bubbles: true,
+                                                                    cancelable: true,
+                                                                    view: window
+                                                                });
+                                                                confirmButton.dispatchEvent(clickEvent);
+                                                                return true;
+                                                            } catch (e2) {
+                                                                return false;
                                                             }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2454,59 +2535,59 @@ class MainWindow(tk.Tk):
                                         }
                                         """
                                     ),
-                                        require_selector=False
-                                    )
-                                    if modal_confirmed:
-                                        self._log("✓ 已点击确认按钮（处理'该商品已关联/已上传讲解'提示）")
-                                        logger.info("已点击确认按钮，处理确认弹窗")
-                                        # 等待模态框关闭
-                                        time.sleep(0.5)
-                                        break
-                                except Exception:
-                                    pass
-                                time.sleep(0.1)
-                            
-                            if not modal_confirmed:
-                                self._log("未检测到确认模态框（这是正常的，不是所有商品都需要确认）")
-                        except Exception as modal_exc:  # noqa: BLE001
-                            logger.exception("处理确认模态框时发生异常")
-                            self._log(f"处理确认模态框异常：{modal_exc}")
-                        
-                        # 点击"讲解"后，页面可能会重新加载，需要等待页面完全加载
-                        self._log("等待页面重新加载（点击讲解后）...")
-                        try:
-                            # 等待页面加载完成（如果页面重新加载了）
-                            with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
-                            self._log("页面加载完成")
-                        except Exception:
-                            self._log("页面可能没有重新加载，继续等待...")
-                        
-                        # 等待商品列表重新渲染
-                        self._log("等待商品列表重新渲染...")
-                        time.sleep(3)  # 等待3秒，确保React应用完全渲染
-                        
-                        # 再次等待网络空闲，确保所有资源加载完成
-                        try:
-                            with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=10000), require_selector=False)
-                            time.sleep(1)  # 额外等待1秒
+                                require_selector=False,
+                            )
+                            if modal_confirmed:
+                                self._log("✓ 已点击确认按钮（处理'该商品已关联/已上传讲解'提示）")
+                                logger.info("已点击确认按钮，处理确认弹窗")
+                                # 等待模态框关闭
+                                time.sleep(0.5)
+                                break
                         except Exception:
                             pass
-                        
-                        self._log("页面状态已稳定，开始讲解")
-                        self._log(f"开始讲解：{title}")
-                        
-                        # 等待讲解时间：与页面显示的"讲解中"计时同步
-                        self._log(f"开始监控页面讲解时长，目标 {duration} 秒")
-                        start_time = time.time()
-                        last_timer_text: Optional[str] = None
-                        timer_not_found_logged = False
-                        while not self.task_stop_event.is_set():
-                            elapsed = time.time() - start_time
-                            reached = False
-                            timer_info = None
-                            try:
-                                timer_info = with_context(
-                                    lambda ctx, idx=index: ctx.evaluate(
+                        time.sleep(0.1)
+                    
+                    if not modal_confirmed:
+                        self._log("未检测到确认模态框（这是正常的，不是所有商品都需要确认）")
+                except Exception as modal_exc:  # noqa: BLE001
+                    logger.exception("处理确认模态框时发生异常")
+                    self._log(f"处理确认模态框异常：{modal_exc}")
+                
+                # 点击"讲解"后，页面可能会重新加载，需要等待页面完全加载
+                self._log("等待页面重新加载（点击讲解后）...")
+                try:
+                    # 等待页面加载完成（如果页面重新加载了）
+                    interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                    self._log("页面加载完成")
+                except Exception:
+                    self._log("页面可能没有重新加载，继续等待...")
+                
+                # 等待商品列表重新渲染
+                self._log("等待商品列表重新渲染...")
+                time.sleep(3)  # 等待3秒，确保React应用完全渲染
+                
+                # 再次等待网络空闲，确保所有资源加载完成
+                try:
+                    interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=10000), require_selector=False)
+                    time.sleep(1)  # 额外等待1秒
+                except Exception:
+                    pass
+                
+                self._log("页面状态已稳定，开始讲解")
+                self._log(f"开始讲解：{title}")
+                
+                # 等待讲解时间：与页面显示的"讲解中"计时同步
+                self._log(f"开始监控页面讲解时长，目标 {duration} 秒")
+                start_time = time.time()
+                last_timer_text: Optional[str] = None
+                timer_not_found_logged = False
+                while not self.task_stop_event.is_set():
+                    elapsed = time.time() - start_time
+                    reached = False
+                    timer_info = None
+                    try:
+                        timer_info = interactor.with_context(
+                            lambda ctx, idx=index: ctx.evaluate(
                                 """
                                 ({ itemSelector, index }) => {
                                     const items = Array.from(document.querySelectorAll(itemSelector));
@@ -2540,121 +2621,121 @@ class MainWindow(tk.Tk):
                                     "itemSelector": item_selector,
                                     "index": index,
                                 },
-                                    ),
-                                    require_selector=False,
-                                )
-                            except Exception as timer_exc:  # noqa: BLE001
-                                logger.debug("获取页面讲解计时器失败: {}", timer_exc)
-                                timer_info = None
-                            
-                            if timer_info and timer_info.get("seconds") is not None:
-                                current_seconds = timer_info["seconds"]
-                                timer_text = timer_info.get("text") or ""
-                                if timer_text and timer_text != last_timer_text:
-                                    self._log(f"页面讲解计时：{timer_text}（{current_seconds} 秒）")
-                                    last_timer_text = timer_text
-                                if current_seconds >= duration:
-                                    self._log(f"页面讲解计时达到目标 {duration} 秒（当前 {timer_text}），准备停止当前讲解")
-                                    reached = True
-                            else:
-                                if not timer_not_found_logged:
-                                    self._log("未检测到页面讲解计时器，使用本地计时作为兜底")
-                                    timer_not_found_logged = True
-                                if elapsed >= duration:
-                                    self._log(f"本地计时达到 {duration} 秒，页面未提供有效计时，准备停止当前讲解")
-                                    reached = True
-                            
-                            if reached:
-                                break
-                            
-                            if elapsed >= duration * 2:
-                                self._log(f"页面计时迟迟未达到目标，已等待 {elapsed:.1f} 秒，安全停止当前讲解")
-                                break
-                            
-                            if self.task_stop_event.wait(1):
-                                break
-                        
-                        # 在开始下一个商品之前，先停止当前讲解
-                        self._log(f"讲解时间到，准备停止当前讲解：{title}")
+                            ),
+                            require_selector=False,
+                        )
+                    except Exception as timer_exc:  # noqa: BLE001
+                        logger.debug("获取页面讲解计时器失败: {}", timer_exc)
+                        timer_info = None
+                    
+                    if timer_info and timer_info.get("seconds") is not None:
+                        current_seconds = timer_info["seconds"]
+                        timer_text = timer_info.get("text") or ""
+                        if timer_text and timer_text != last_timer_text:
+                            self._log(f"页面讲解计时：{timer_text}（{current_seconds} 秒）")
+                            last_timer_text = timer_text
+                        if current_seconds >= duration:
+                            self._log(f"页面讲解计时达到目标 {duration} 秒（当前 {timer_text}），准备停止当前讲解")
+                            reached = True
+                    else:
+                        if not timer_not_found_logged:
+                            self._log("未检测到页面讲解计时器，使用本地计时作为兜底")
+                            timer_not_found_logged = True
+                        if elapsed >= duration:
+                            self._log(f"本地计时达到 {duration} 秒，页面未提供有效计时，准备停止当前讲解")
+                            reached = True
+                    
+                    if reached:
+                        break
+                    
+                    if elapsed >= duration * 2:
+                        self._log(f"页面计时迟迟未达到目标，已等待 {elapsed:.1f} 秒，安全停止当前讲解")
+                        break
+                    
+                    if self.task_stop_event.wait(1):
+                        break
+                
+                # 在开始下一个商品之前，先停止当前讲解
+                self._log(f"讲解时间到，准备停止当前讲解：{title}")
+                try:
+                    # 先等待一下，确保页面有时间更新显示停止按钮
+                    time.sleep(0.5)
+                    
+                    # 使用 Playwright 的方式查找和点击停止按钮
+                    stopped = False
+                    max_attempts = 20  # 增加尝试次数到20次
+                    
+                    for stop_attempt in range(max_attempts):
+                        if self.task_stop_event.is_set():
+                            break
                         try:
-                            # 先等待一下，确保页面有时间更新显示停止按钮
-                            time.sleep(0.5)
-                            
-                            # 使用 Playwright 的方式查找和点击停止按钮
-                            stopped = False
-                            max_attempts = 20  # 增加尝试次数到20次
-                            
-                            for stop_attempt in range(max_attempts):
-                                if self.task_stop_event.is_set():
-                                    break
+                            # 尝试使用 Playwright 选择器查找停止按钮
+                            def try_click_stop_button(page: Page) -> tuple[bool, str]:
+                                """尝试点击停止按钮，返回(是否成功, 调试信息)"""
+                                debug_msgs = []
+                                
+                                # 获取当前商品项
                                 try:
-                                    # 尝试使用 Playwright 选择器查找停止按钮
-                                    def try_click_stop_button(page: Page) -> tuple[bool, str]:
-                                        """尝试点击停止按钮，返回(是否成功, 调试信息)"""
-                                        debug_msgs = []
+                                    items = page.query_selector_all(item_selector)
+                                    if index < len(items):
+                                        current_item = items[index]
+                                        debug_msgs.append(f"找到当前商品项（索引 {index}）")
                                         
-                                        # 获取当前商品项
+                                        # 方式1: 在当前商品项内查找"结束"按钮（包含selectBtn和hover类）
                                         try:
-                                            items = page.query_selector_all(item_selector)
-                                            if index < len(items):
-                                                current_item = items[index]
-                                                debug_msgs.append(f"找到当前商品项（索引 {index}）")
-                                                
-                                                # 方式1: 在当前商品项内查找"结束"按钮（包含selectBtn和hover类）
-                                                try:
-                                                    # 先查找包含这两个类的span
-                                                    candidate_spans = current_item.query_selector_all(
-                                                        'span.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-hover'
-                                                    )
-                                                    for span in candidate_spans:
-                                                        text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
-                                                        if text == '结束':
-                                                            debug_msgs.append("方式1: 在当前商品项内找到停止按钮（selectBtn+hover）")
-                                                            span.scroll_into_view_if_needed()
-                                                            span.click(timeout=1000)
-                                                            return True, " | ".join(debug_msgs)
-                                                except Exception:
-                                                    pass
-                                                
-                                                # 方式2: 在当前商品项内查找包含"结束"文本的span
-                                                try:
-                                                    all_spans = current_item.query_selector_all('span')
-                                                    for span in all_spans:
-                                                        text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
-                                                        if text == '结束':
-                                                            debug_msgs.append("方式2: 在当前商品项内找到'结束'文本的span")
-                                                            span.scroll_into_view_if_needed()
-                                                            span.click(timeout=1000)
-                                                            return True, " | ".join(debug_msgs)
-                                                except Exception:
-                                                    pass
-                                        except Exception as e:
-                                            debug_msgs.append(f"获取商品项失败: {e}")
-                                        
-                                        # 方式3: 在整个页面查找包含"结束"文本的可见按钮
-                                        try:
-                                            # 查找所有包含"结束"的span
-                                            all_spans = page.query_selector_all('span')
-                                            for span in all_spans:
-                                                try:
-                                                    text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
-                                                    if text == '结束':
-                                                        # 检查是否可见
-                                                        is_visible = span.evaluate('el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }')
-                                                        if is_visible:
-                                                            debug_msgs.append("方式3: 在页面中找到可见的'结束'按钮")
-                                                            span.scroll_into_view_if_needed()
-                                                            span.click(timeout=1000)
-                                                            return True, " | ".join(debug_msgs)
-                                                except Exception:
-                                                    continue
+                                            # 先查找包含这两个类的span
+                                            candidate_spans = current_item.query_selector_all(
+                                                'span.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-selectBtn.antd-pro-pages-control-panel-goods-components-normal-goods-sku-item-index-hover'
+                                            )
+                                            for span in candidate_spans:
+                                                text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
+                                                if text == '结束':
+                                                    debug_msgs.append("方式1: 在当前商品项内找到停止按钮（selectBtn+hover）")
+                                                    span.scroll_into_view_if_needed()
+                                                    span.click(timeout=1000)
+                                                    return True, " | ".join(debug_msgs)
                                         except Exception:
                                             pass
                                         
-                                        # 方式4: 使用JavaScript查找和点击
+                                        # 方式2: 在当前商品项内查找包含"结束"文本的span
                                         try:
-                                            result = page.evaluate("""
-                                                ([itemSelector, itemIndex]) => {
+                                            all_spans = current_item.query_selector_all('span')
+                                            for span in all_spans:
+                                                text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
+                                                if text == '结束':
+                                                    debug_msgs.append("方式2: 在当前商品项内找到'结束'文本的span")
+                                                    span.scroll_into_view_if_needed()
+                                                    span.click(timeout=1000)
+                                                    return True, " | ".join(debug_msgs)
+                                        except Exception:
+                                            pass
+                                except Exception as e:
+                                    debug_msgs.append(f"获取商品项失败: {e}")
+                                
+                                # 方式3: 在整个页面查找包含"结束"文本的可见按钮
+                                try:
+                                    # 查找所有包含"结束"的span
+                                    all_spans = page.query_selector_all('span')
+                                    for span in all_spans:
+                                        try:
+                                            text = span.inner_text().strip() if hasattr(span, 'inner_text') else (span.evaluate('el => el.textContent') or '').strip()
+                                            if text == '结束':
+                                                # 检查是否可见
+                                                is_visible = span.evaluate('el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }')
+                                                if is_visible:
+                                                    debug_msgs.append("方式3: 在页面中找到可见的'结束'按钮")
+                                                    span.scroll_into_view_if_needed()
+                                                    span.click(timeout=1000)
+                                                    return True, " | ".join(debug_msgs)
+                                        except Exception:
+                                            continue
+                                except Exception:
+                                    pass
+                                
+                                # 方式4: 使用JavaScript查找和点击
+                                try:
+                                    result = page.evaluate("""
+                                        ([itemSelector, itemIndex]) => {
                                             // 获取当前商品项
                                             const items = Array.from(document.querySelectorAll(itemSelector));
                                             const currentItem = items[itemIndex];
@@ -2689,214 +2770,177 @@ class MainWindow(tk.Tk):
                                                 }
                                             }
                                             
-                                                    return { success: false, error: '未找到停止按钮' };
-                                                }
-                                            """, [item_selector, index])
-                                            
-                                            if result and result.get("success"):
-                                                debug_msgs.append(f"方式4: JavaScript找到并点击停止按钮（方法: {result.get('method')}）")
-                                                return True, " | ".join(debug_msgs)
-                                        except Exception as e:
-                                            debug_msgs.append(f"JavaScript查找失败: {e}")
-                                        
-                                        return False, " | ".join(debug_msgs) if debug_msgs else "未找到停止按钮"
+                                            return { success: false, error: '未找到停止按钮' };
+                                        }
+                                    """, [item_selector, index])
                                     
-                                    success, debug_msg = with_context(try_click_stop_button, require_selector=False)
-                                    
-                                    if success:
-                                        self._log(f"✓ 已点击停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）")
-                                        self._log(f"  调试信息: {debug_msg}")
-                                        stopped = True
-                                        time.sleep(2)  # 等待停止操作完成
-                                        break
-                                    else:
-                                        # 记录调试信息
-                                        if stop_attempt == 0 or stop_attempt % 5 == 0:  # 每5次尝试记录一次
-                                            self._log(f"查找停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）: {debug_msg}")
-                                            
-                                        # 额外记录页面状态
-                                        try:
-                                            page_info = with_context(
-                                                lambda ctx: ctx.evaluate("""
-                                                    () => {
-                                                        const allSpans = Array.from(document.querySelectorAll('span'));
-                                                        const endButtons = allSpans.filter(s => (s.textContent || '').trim() === '结束');
-                                                        return {
-                                                            totalEndButtons: endButtons.length,
-                                                            visibleEndButtons: endButtons.filter(s => {
-                                                                const rect = s.getBoundingClientRect();
-                                                                return rect.width > 0 && rect.height > 0;
-                                                            }).length
-                                                        };
-                                                    }
-                                                """),
-                                                require_selector=False
-                                            )
-                                            if page_info:
-                                                self._log(f"  页面状态: 共找到 {page_info.get('totalEndButtons', 0)} 个'结束'按钮，其中 {page_info.get('visibleEndButtons', 0)} 个可见")
-                                        except Exception:
-                                            pass
-                                            
-                                except Exception as e:  # noqa: BLE001
-                                    if stop_attempt == 0 or stop_attempt % 5 == 0:
-                                        logger.debug("查找停止按钮异常（尝试 {}）: {}", stop_attempt + 1, e)
-                                        self._log(f"查找停止按钮异常（尝试 {stop_attempt + 1}/{max_attempts}）: {e}")
-                                time.sleep(0.4)  # 等待间隔
-                            
-                            if not stopped:
-                                self._log(f"⚠️ 警告: 未找到停止按钮（已尝试 {max_attempts} 次），可能页面结构已变化或按钮未显示")
-                                logger.warning("未找到停止按钮，商品: {}", title)
-                        except Exception as stop_exc:  # noqa: BLE001
-                            logger.exception("停止讲解时发生异常")
-                            self._log(f"停止讲解异常：{stop_exc}")
-                        
-                        self._log(f"讲解结束：{title}")
-                        
-                        # 停止后，页面可能会重新加载，需要等待页面完全加载
-                        self._log("等待页面重新加载...")
-                        try:
-                            # 等待页面加载完成（如果页面重新加载了）
-                            with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
-                            self._log("页面加载完成")
-                        except Exception:
-                            self._log("页面可能没有重新加载，继续等待...")
-                        
-                        # 等待页面完全稳定，确保商品列表重新渲染
-                        self._log("等待商品列表重新渲染...")
-                        time.sleep(3)  # 等待3秒，确保React应用完全渲染
-                        
-                        # 再次等待网络空闲，确保所有资源加载完成
-                        try:
-                            with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=10000), require_selector=False)
-                            time.sleep(1)  # 额外等待1秒
-                        except Exception:
-                            pass
-                        
-                        self._log("页面状态已稳定，准备处理下一个商品")
-                        
-                        # 处理完成后，将索引和SKU添加到已处理列表
-                        processed_indices.add(index)
-                        if sku:
-                            processed_skus.add(sku)
-                        last_processed_index = index  # 记录本次处理的索引
-                        last_processed_sku = sku  # 记录本次处理的SKU
-                        self._log(f"已标记商品为已处理：索引={index}, SKU={sku}, 编号={item_index}，已处理列表大小：索引={len(processed_indices)}, SKU={len(processed_skus)}")
-                        logger.info("已标记商品为已处理：索引={}, SKU={}, 编号={}，已处理列表大小：索引={}, SKU={}", index, sku, item_index, len(processed_indices), len(processed_skus))
-                        # 记录本次处理的商品编号（itemIndex）
-                        try:
-                            if item_index is not None and item_index != "无编号":
-                                # 尝试转换为数字以便后续比较
-                                if isinstance(item_index, str):
-                                    try:
-                                        last_processed_item_index = int(item_index)
-                                    except ValueError:
-                                        last_processed_item_index = item_index
-                                else:
-                                    last_processed_item_index = int(item_index)
-                                self._log(f"已记录商品编号: {last_processed_item_index}")
-                                logger.info("已记录商品编号: {}", last_processed_item_index)
+                                    if result and result.get("success"):
+                                        debug_msgs.append(f"方式4: JavaScript找到并点击停止按钮（方法: {result.get('method')}）")
+                                        return True, " | ".join(debug_msgs)
+                                except Exception as e:
+                                    debug_msgs.append(f"JavaScript查找失败: {e}")
                                 
-                            else:
-                                self._log("商品编号为空或无效，无法记录")
-                                logger.info("商品编号为空或无效，无法记录")
-                        except Exception as e:
-                            logger.debug("记录商品编号时发生异常: {}", e)
-                            last_processed_item_index = None
-                        
-                        self._log(f"已记录商品（索引: {index}, SKU: {sku}, 编号: {last_processed_item_index}）到已处理列表（处理完成）")
-                        logger.info("已记录商品（索引: {}, SKU: {}, 编号: {}）到已处理列表（处理完成）", index, sku, last_processed_item_index)
-                        
-                        processed_count += 1
-
-                        # 如果还有商品未处理，等待间隔时间
-                        if processed_count < goods_count and interval > 0:
-                            self._log(f"等待 {interval} 秒准备下一场。")
-                            if self.task_stop_event.wait(interval):
-                                break
+                                return False, " | ".join(debug_msgs) if debug_msgs else "未找到停止按钮"
                             
-                            # 间隔等待后，再次确保页面稳定
-                            try:
-                                with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=5000), require_selector=False)
-                                time.sleep(1)  # 增加等待时间，确保页面状态更新
-                            except Exception:
-                                pass
-                        
-                        # 重要：在下次循环开始前，再次等待一下，确保页面状态完全更新
-                        # 这样重新查询商品列表时，第一个商品的状态应该已经更新（不再是"讲解"）
-                        time.sleep(0.5)
+                            success, debug_msg = interactor.with_context(try_click_stop_button, require_selector=False)
+                            
+                            if success:
+                                self._log(f"✓ 已点击停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）")
+                                self._log(f"  调试信息: {debug_msg}")
+                                stopped = True
+                                time.sleep(2)  # 等待停止操作完成
+                                break
+                            else:
+                                # 记录调试信息
+                                if stop_attempt == 0 or stop_attempt % 5 == 0:  # 每5次尝试记录一次
+                                    self._log(f"查找停止按钮（尝试 {stop_attempt + 1}/{max_attempts}）: {debug_msg}")
+                                    
+                                # 额外记录页面状态
+                                try:
+                                    page_info = interactor.with_context(
+                                        lambda ctx: ctx.evaluate("""
+                                            () => {
+                                                const allSpans = Array.from(document.querySelectorAll('span'));
+                                                const endButtons = allSpans.filter(s => (s.textContent || '').trim() === '结束');
+                                                return {
+                                                    totalEndButtons: endButtons.length,
+                                                    visibleEndButtons: endButtons.filter(s => {
+                                                        const rect = s.getBoundingClientRect();
+                                                        return rect.width > 0 && rect.height > 0;
+                                                    }).length
+                                                };
+                                            }
+                                            """),
+                                        require_selector=False
+                                    )
+                                    if page_info:
+                                        self._log(f"  页面状态: 共找到 {page_info.get('totalEndButtons', 0)} 个'结束'按钮，其中 {page_info.get('visibleEndButtons', 0)} 个可见")
+                                except Exception:
+                                    pass
+                                    
+                        except Exception as e:  # noqa: BLE001
+                            if stop_attempt == 0 or stop_attempt % 5 == 0:
+                                logger.debug("查找停止按钮异常（尝试 {}）: {}", stop_attempt + 1, e)
+                                self._log(f"查找停止按钮异常（尝试 {stop_attempt + 1}/{max_attempts}）: {e}")
+                        time.sleep(0.4)  # 等待间隔
                     
-                    # 继续循环处理当前页的下一个商品（不在这里翻页）
-                    except Exception as item_exc:  # noqa: BLE001
-                        logger.exception("处理商品时发生异常")
-                        self._log(f"处理商品异常：{item_exc}")
-                        # 即使发生异常，也标记为已处理，避免重复处理
-                        processed_indices.add(index)
-                        if sku:
-                            processed_skus.add(sku)
-                        processed_count += 1
-                        continue
+                    if not stopped:
+                        self._log(f"⚠️ 警告: 未找到停止按钮（已尝试 {max_attempts} 次），可能页面结构已变化或按钮未显示")
+                        logger.warning("未找到停止按钮，商品: {}", title)
+                except Exception as stop_exc:  # noqa: BLE001
+                    logger.exception("停止讲解时发生异常")
+                    self._log(f"停止讲解异常：{stop_exc}")
+                    
+                self._log(f"讲解结束：{title}")
                 
-                # 当前页处理完成，尝试翻到下一页继续处理
+                # 停止后，页面可能会重新加载，需要等待页面完全加载
+                self._log("等待页面重新加载...")
+                try:
+                    # 等待页面加载完成（如果页面重新加载了）
+                    interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
+                    self._log("页面加载完成")
+                except Exception:
+                    self._log("页面可能没有重新加载，继续等待...")
+                
+                # 等待页面完全稳定，确保商品列表重新渲染
+                self._log("等待商品列表重新渲染...")
+                time.sleep(3)  # 等待3秒，确保React应用完全渲染
+                
+                # 再次等待网络空闲，确保所有资源加载完成
+                try:
+                    interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=10000), require_selector=False)
+                    time.sleep(1)  # 额外等待1秒
+                except Exception:
+                    pass
+                
+                self._log("页面状态已稳定，准备处理下一个商品")
+                
+                # 处理完成后，将索引和SKU添加到已处理列表
+                processed_indices.add(index)
+                if sku:
+                    processed_skus.add(sku)
+                last_processed_index = index  # 记录本次处理的索引
+                last_processed_sku = sku  # 记录本次处理的SKU
+                self._log(f"已标记商品为已处理：索引={index}, SKU={sku}, 编号={item_index}，已处理列表大小：索引={len(processed_indices)}, SKU={len(processed_skus)}")
+                logger.info("已标记商品为已处理：索引={}, SKU={}, 编号={}，已处理列表大小：索引={}, SKU={}", index, sku, item_index, len(processed_indices), len(processed_skus))
+                # 记录本次处理的商品编号（itemIndex）
+                try:
+                    if item_index is not None and item_index != "无编号":
+                        # 尝试转换为数字以便后续比较
+                        if isinstance(item_index, str):
+                            try:
+                                last_processed_item_index = int(item_index)
+                            except ValueError:
+                                last_processed_item_index = item_index
+                        else:
+                            last_processed_item_index = int(item_index)
+                        self._log(f"已记录商品编号: {last_processed_item_index}")
+                        logger.info("已记录商品编号: {}", last_processed_item_index)
+                        
+                    else:
+                        self._log("商品编号为空或无效，无法记录")
+                        logger.info("商品编号为空或无效，无法记录")
+                except Exception as e:
+                    logger.debug("记录商品编号时发生异常: {}", e)
+                    last_processed_item_index = None
+                
+                self._log(f"已记录商品（索引: {index}, SKU: {sku}, 编号: {last_processed_item_index}）到已处理列表（处理完成）")
+                logger.info("已记录商品（索引: {}, SKU: {}, 编号: {}）到已处理列表（处理完成）", index, sku, last_processed_item_index)
+                
+                processed_count += 1
+
+                # 如果还有商品未处理，等待间隔时间
+                if processed_count < goods_count and interval > 0:
+                    self._log(f"等待 {interval} 秒准备下一场。")
+                    if self.task_stop_event.wait(interval):
+                        break
+                    
+                    # 间隔等待后，再次确保页面稳定
+                    try:
+                        interactor.with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=5000), require_selector=False)
+                        time.sleep(1)  # 增加等待时间，确保页面状态更新
+                    except Exception:
+                        pass
+                
+                    # 重要：在下次循环开始前，再次等待一下，确保页面状态完全更新
+                    # 这样重新查询商品列表时，第一个商品的状态应该已经更新（不再是"讲解"）
+                    time.sleep(0.5)
+            
+            # 当前页处理完成，尝试翻到下一页继续处理
+            
+            # 当前页处理完成，尝试翻到下一页继续处理
                 # 如果是第一页且没有处理任何商品，记录警告并阻止翻页
                 if current_page_num == 1 and processed_count == 0:
-                    if len(current_items) == 0:
-                        self._log("⚠️ 警告：第一页没有找到任何可讲解的商品，请检查第一页是否确实有商品")
-                        logger.warning("第一页没有找到任何可讲解的商品")
-                        # 如果是第一页且没有商品，不应该翻页，应该结束任务
-                        self._log("第一页没有商品，停止处理")
-                        break
-                    else:
-                        self._log("⚠️ 警告：第一页有商品但未处理任何商品，可能是处理逻辑有问题")
-                        logger.warning("第一页有商品但未处理任何商品")
-                        # 即使有商品但没处理，也不应该翻页，应该继续尝试处理
-                        self._log("继续尝试处理第一页的商品...")
-                        continue
+                        if len(current_items) == 0:
+                            self._log("⚠️ 警告：第一页没有找到任何可讲解的商品，请检查第一页是否确实有商品")
+                            logger.warning("第一页没有找到任何可讲解的商品")
+                            # 如果是第一页且没有商品，不应该翻页，应该结束任务
+                            self._log("第一页没有商品，停止处理")
+                            break
+                        else:
+                            self._log("⚠️ 警告：第一页有商品但未处理任何商品，可能是处理逻辑有问题")
+                            logger.warning("第一页有商品但未处理任何商品")
+                            # 即使有商品但没处理，也不应该翻页，应该继续尝试处理
+                            self._log("继续尝试处理第一页的商品...")
+                            continue
                 
                 if current_page_num < total_pages:
-                    pagination_status = _get_pagination_status()
-                    next_disabled = pagination_status.get("nextDisabled", True)
-                    
-                    if not next_disabled:
-                        # 点击下一页
-                        next_clicked = with_context(
-                            lambda ctx: ctx.evaluate("""
-                            () => {
-                                const nextBtn = document.querySelector('li.ant-pagination-next button');
-                                if (nextBtn && !nextBtn.disabled) {
-                                    nextBtn.click();
-                                    return true;
-                                }
-                                return false;
-                            }
-                            """),
-                            require_selector=False
-                        )
-                        
-                        if next_clicked:
-                            current_page_num += 1
-                            self._log(f"已点击下一页，开始处理第 {current_page_num} 页（共 {total_pages} 页）。")
-                            logger.info("已点击下一页，开始处理第 {} 页（共 {} 页）", current_page_num, total_pages)
-                            # 等待页面加载
-                            try:
-                                with_context(lambda ctx: ctx.wait_for_load_state("networkidle", timeout=15000), require_selector=False)
-                                time.sleep(2)  # 等待页面渲染
-                            except Exception:
-                                pass
-                            
-                            # 重置当前页的处理状态
-                            processed_indices.clear()
-                            processed_skus.clear()
-                            last_processed_index = -1
-                            last_processed_sku = None
-                            
-                            # 重新获取商品列表，继续处理（继续外层循环）
-                            continue
-                        else:
-                            self._log("下一页按钮不可用，已处理完所有页面。")
-                            logger.info("下一页按钮不可用，已处理完所有页面")
+                    success, new_page = self._navigate_to_next_page(interactor, current_page_num, total_pages)
+                    if success:
+                        current_page_num = new_page
+                    # 重置当前页的处理状态
+                    processed_indices.clear()
+                    processed_skus.clear()
+                    last_processed_index = -1
+                    last_processed_sku = None
+                        # 重新获取商品列表，继续处理（继续外层循环）
+                    continue
                 else:
-                    self._log(f"已处理完最后一页（第 {total_pages} 页），所有页面处理完成。")
-                    logger.info("已处理完最后一页（第 {} 页），所有页面处理完成", total_pages)
+                    self._log("下一页按钮不可用，已处理完所有页面。")
+                    logger.info("下一页按钮不可用，已处理完所有页面")
+            else:
+                self._log(f"已处理完最后一页（第 {total_pages} 页），所有页面处理完成。")
+                logger.info("已处理完最后一页（第 {} 页），所有页面处理完成", total_pages)
 
             if self.task_stop_event.is_set():
                 self._log("自动讲解任务已被手动停止。")
@@ -2962,12 +3006,6 @@ class MainWindow(tk.Tk):
 
         return True
 
-    def _on_browse_material(self) -> None:
-        path = filedialog.askdirectory(title="选择卡点素材文件夹")
-        if path:
-            self.material_path_var.set(path)
-            self._log(f"已选择素材目录：{path}")
-
     def _on_browse_license_file(self) -> None:
         file_path = filedialog.askopenfilename(
             title="选择卡密文件",
@@ -3003,7 +3041,6 @@ class MainWindow(tk.Tk):
         self.config["app"]["default_port"] = port
         self.config["task"]["duration_seconds"] = duration
         self.config["task"]["interval_seconds"] = interval
-        self.config["task"]["material_path"] = self.material_path_var.get().strip()
         self.config_manager.save(self.config)
         self._log("配置保存成功。")
         messagebox.showinfo("保存成功", "配置已写入 settings.yaml。")

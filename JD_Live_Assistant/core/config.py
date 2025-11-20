@@ -13,6 +13,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "default_port": 9222,
         "live_url": "https://live.jd.com/#/anchor/live-list",
     },
+    "browser": {
+        "chrome_path": "",
+        "profile_root": "",
+        "port_profiles": {},
+    },
     "schedule": {
         "daily_start_time": "09:00",
     },
