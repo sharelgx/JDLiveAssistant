@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import queue
-import re
 import threading
 import time
 import tkinter as tk
@@ -52,6 +50,10 @@ class MainWindow(tk.Tk):
         self.license_manager = license_manager
         self.config = self.config_manager.data
         self.browser_config: Dict[str, Any] = self.config.setdefault("browser", {})
+        self.material_config: Dict[str, Any] = self.config.setdefault(
+            "materials",
+            {"directory": ""},
+        )
         self.chrome_launcher = ChromeLauncher(
             chrome_path=self.browser_config.get("chrome_path"),
             profile_root=self.browser_config.get("profile_root") or None,
@@ -66,8 +68,6 @@ class MainWindow(tk.Tk):
 
         self._setup_variables()
         self._ensure_browser_config()
-        self.port_var.trace_add("write", lambda *_: self._update_material_path_display())
-        self._update_material_path_display()
         self._build_ui()
         self._load_config()
         self._refresh_license_status()
@@ -88,7 +88,7 @@ class MainWindow(tk.Tk):
         )
         self.duration_var = tk.StringVar(value=str(task_config.get("duration_seconds", 8)))
         self.interval_var = tk.StringVar(value=str(task_config.get("interval_seconds", 2)))
-        self.material_path_var = tk.StringVar(value="")
+        self.material_path_var = tk.StringVar(value=self.material_config.get("directory", ""))
         self.license_var = tk.StringVar(value=license_info.key if license_info else "")
         self.license_status_var = tk.StringVar(value="未授权，功能已锁定")
         self.hotkey_summary_var = tk.StringVar(value="")
@@ -121,138 +121,51 @@ class MainWindow(tk.Tk):
             return "未检测到 Chrome，绑定时将提示"
         return str(path)
 
-    def _material_base_dir(self) -> Path:
-        root = self.browser_config.get("profile_root")
-        if root:
-            try:
-                return Path(root)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("解析浏览器数据目录失败: {}", exc)
-        return self.chrome_launcher.profile_root
-
-    def _get_port_profiles(self) -> Dict[str, str]:
-        profiles = self.browser_config.setdefault("port_profiles", {})
-        if not isinstance(profiles, dict):
-            profiles = {}
-            self.browser_config["port_profiles"] = profiles
-        return profiles
-
-    def _resolve_material_path_for_port(self, port: int, ensure_exists: bool = False) -> Path:
-        profiles = self._get_port_profiles()
-        profile_path = profiles.get(str(port))
-        if profile_path:
-            path = Path(profile_path)
-        else:
-            path = (self._material_base_dir() / str(port)).resolve()
-        if ensure_exists:
-            path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _get_material_directory(self, port: int) -> Path:
-        directory = self._resolve_material_path_for_port(port, ensure_exists=True)
-        self._set_material_path_text(str(directory))
+    def _ensure_material_directory_selected(self) -> Optional[Path]:
+        """确保素材目录可用。"""
+        path_str = self.material_path_var.get().strip()
+        if not path_str:
+            self._log("尚未选择素材目录。")
+            messagebox.showwarning("素材目录未设置", "请点击“选择目录”手动指定素材存放位置。")
+            return None
+        try:
+            directory = Path(path_str)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("路径无效", f"无法解析素材目录：{exc}")
+            return None
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("创建目录失败", f"无法创建目录：{exc}")
+            return None
         return directory
 
-    def _update_material_path_display(self) -> None:
-        """更新素材路径显示。"""
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            self._set_material_path_text("端口未填写，待确定")
+    def _get_material_directory(self) -> Optional[Path]:
+        """返回可用的素材目录；若未设置则提示用户选择。"""
+        directory = self._ensure_material_directory_selected()
+        if directory:
+            return directory
+        self._on_select_material_directory()
+        return self._ensure_material_directory_selected()
+
+    def _on_select_material_directory(self) -> None:
+        initial_dir = self.material_path_var.get().strip() or str(Path.home())
+        selected = filedialog.askdirectory(
+            title="选择素材目录",
+            initialdir=initial_dir,
+        )
+        if not selected:
             return
-        
-        # 如果已经绑定浏览器，使用已保存的配置
-        # 否则显示默认路径（不创建目录）
-        directory = self._resolve_material_path_for_port(port, ensure_exists=False)
-        self._set_material_path_text(str(directory))
-
-    def _set_material_path_text(self, value: str) -> None:
-        if threading.current_thread() is threading.main_thread():
-            self.material_path_var.set(value)
-        else:
-            self.after(0, lambda v=value: self.material_path_var.set(v))
-
-    def _remember_port_profile(self, port: int, directory: Path) -> None:
-        profiles = self._get_port_profiles()
-        resolved = str(directory.resolve())
-        key = str(port)
-        if profiles.get(key) == resolved:
+        directory = Path(selected).resolve()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("创建目录失败", f"无法创建目录：{exc}")
             return
-        profiles[key] = resolved
-        self._set_material_path_text(resolved)
-        try:
-            self.config_manager.save(self.config)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("保存浏览器配置失败: {}", exc)
-
-    def _sync_port_profile(self, controller: BrowserController, port: int) -> None:
-        """同步端口配置：从已连接的浏览器获取 user-data-dir 并确定素材文件夹。"""
-        self._log("正在获取浏览器的 user-data-dir 参数...")
-        
-        # 方法1: 通过 CDP /json/version 获取
-        detected = self._detect_user_data_dir_via_port(port)
-        
-        # 方法2: 如果方法1失败，通过浏览器命令行参数获取
-        if not detected:
-            detected = self._detect_user_data_dir_from_browser(controller)
-        
-        if detected:
-            self._log(f"检测到浏览器的 user-data-dir: {detected}")
-            self._remember_port_profile(port, detected)
-            self._update_material_path_display()
-            self._log(f"素材文件夹已确定为: {detected}")
-        else:
-            # 如果无法检测到，使用默认路径
-            default_path = self._resolve_material_path_for_port(port, ensure_exists=True)
-            self._log(f"未能检测到浏览器的 user-data-dir，使用默认素材目录: {default_path}")
-            self._set_material_path_text(str(default_path))
-
-    def _detect_user_data_dir_via_port(self, port: int) -> Optional[Path]:
-        try:
-            with urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3) as response:
-                payload = response.read().decode("utf-8", errors="ignore")
-            data = json.loads(payload)
-            user_data_dir = data.get("userDataDir") or data.get("userdatadir")
-            if user_data_dir:
-                return Path(user_data_dir)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("通过端口获取 user-data-dir 失败: {}", exc)
-        return None
-
-    def _detect_user_data_dir_from_browser(self, controller: BrowserController) -> Optional[Path]:
-        try:
-            command_line = controller.perform(self._fetch_browser_command_line)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("获取浏览器命令行失败: {}", exc)
-            return None
-        if not command_line:
-            return None
-        return self._parse_user_data_dir_from_cmd(command_line)
-
-    @staticmethod
-    def _fetch_browser_command_line(page: Page) -> str:
-        session = page.context.new_cdp_session(page)
-        try:
-            version_info = session.send("Browser.getVersion")
-            return version_info.get("commandLine", "")
-        finally:
-            session.detach()
-
-    @staticmethod
-    def _parse_user_data_dir_from_cmd(command_line: str) -> Optional[Path]:
-        if not command_line:
-            return None
-        match = re.search(r'--user-data-dir=(?:"([^"]+)"|([^\s]+))', command_line)
-        if not match:
-            return None
-        path_str = match.group(1) or match.group(2)
-        if not path_str:
-            return None
-        try:
-            return Path(path_str)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("解析 user-data-dir 失败: {}", exc)
-            return None
+        self.material_path_var.set(str(directory))
+        self.material_config["directory"] = str(directory)
+        self.config_manager.save(self.config)
+        self._log(f"素材目录已更新为：{directory}")
 
     def _build_ui(self) -> None:
         main_frame = ttk.Frame(self, padding=16)
@@ -287,9 +200,11 @@ class MainWindow(tk.Tk):
         interval_entry = ttk.Entry(task_frame, textvariable=self.interval_var, width=12)
         interval_entry.grid(row=0, column=5, padx=(8, 16), sticky=tk.W)
 
-        ttk.Label(task_frame, text="素材目录（自动）").grid(row=1, column=0, sticky=tk.E, pady=(12, 0))
-        material_label = ttk.Label(task_frame, textvariable=self.material_path_var, foreground="#555555")
-        material_label.grid(row=1, column=1, columnspan=6, sticky=tk.W, padx=(8, 0), pady=(12, 0))
+        ttk.Label(task_frame, text="素材目录").grid(row=1, column=0, sticky=tk.E, pady=(12, 0))
+        material_entry = ttk.Entry(task_frame, textvariable=self.material_path_var, state="readonly")
+        material_entry.grid(row=1, column=1, columnspan=5, sticky=tk.EW, padx=(8, 8), pady=(12, 0))
+        material_btn = ttk.Button(task_frame, text="选择目录", command=self._on_select_material_directory)
+        material_btn.grid(row=1, column=6, sticky=tk.W, pady=(12, 0))
 
         ttk.Label(task_frame, text="Chrome 路径").grid(row=2, column=0, sticky=tk.E, pady=(12, 0))
         chrome_label = ttk.Label(task_frame, textvariable=self.chrome_path_var, foreground="#555555")
@@ -374,6 +289,7 @@ class MainWindow(tk.Tk):
                 port_entry,
                 duration_entry,
                 interval_entry,
+                material_btn,
                 connect_btn,
                 disconnect_btn,
                 self.start_task_btn,
@@ -440,8 +356,13 @@ class MainWindow(tk.Tk):
                 self._log(f"开始绑定浏览器，端口: {port}")
                 self._log("提示：请确保已手动打开带参数的Chrome浏览器")
                 self._connect_browser(port)
-                # 绑定成功后，UI会自动更新素材路径
-                self.after(0, lambda: messagebox.showinfo("绑定成功", f"已成功绑定到端口 {port} 的浏览器\n素材文件夹已自动确定"))
+                self.after(
+                    0,
+                    lambda: messagebox.showinfo(
+                        "绑定成功",
+                        f"已成功绑定到端口 {port} 的浏览器。\n请在“素材目录”区域手动选择素材存放路径。",
+                    ),
+                )
             except RuntimeError as exc:
                 logger.exception("绑定浏览器失败")
                 self._log(f"绑定失败：{exc}")
@@ -463,40 +384,6 @@ class MainWindow(tk.Tk):
         # 直接连接，不自动启动浏览器（用户已手动打开带参数的Chrome浏览器）
         controller.connect(port)
         self._log(f"绑定浏览器成功：端口 {port}")
-
-        # 绑定成功后，获取浏览器的 user-data-dir 并确定素材文件夹
-        self._sync_port_profile(controller, port)
-
-    def _attempt_auto_launch(self, port: int) -> bool:
-        if not self.chrome_launcher:
-            return False
-
-        self._log("尝试自动启动 Chrome 并开启远程调试端口...")
-        try:
-            ready = self.chrome_launcher.launch_if_needed(port)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("自动启动 Chrome 失败")
-            self._log(f"自动启动 Chrome 失败：{exc}")
-            return False
-
-        if not ready:
-            self._log("Chrome 启动完成，但端口仍不可用。")
-            return False
-
-        if self.chrome_launcher.last_profile_dir:
-            self._remember_port_profile(port, self.chrome_launcher.last_profile_dir)
-            self._update_material_path_display()
-
-        # 更新缓存的路径信息
-        if self.chrome_launcher.executable:
-            path_value = str(self.chrome_launcher.executable)
-            if self.browser_config.get("chrome_path") != path_value:
-                self.browser_config["chrome_path"] = path_value
-                self.config_manager.save(self.config)
-            self.chrome_path_var.set(self._format_chrome_path())
-
-        self._log("Chrome 已启动，准备重新绑定。")
-        return True
 
     def _on_disconnect(self) -> None:
         self.controller.disconnect()
@@ -551,7 +438,9 @@ class MainWindow(tk.Tk):
             messagebox.showerror("输入错误", "端口必须为整数。")
             return
 
-        directory = self._get_material_directory(port)
+        directory = self._get_material_directory()
+        if not directory:
+            return
         self._log(f"素材目录：{directory}")
 
         if not self.controller.is_connected:
@@ -3041,6 +2930,7 @@ class MainWindow(tk.Tk):
         self.config["app"]["default_port"] = port
         self.config["task"]["duration_seconds"] = duration
         self.config["task"]["interval_seconds"] = interval
+        self.material_config["directory"] = self.material_path_var.get().strip()
         self.config_manager.save(self.config)
         self._log("配置保存成功。")
         messagebox.showinfo("保存成功", "配置已写入 settings.yaml。")

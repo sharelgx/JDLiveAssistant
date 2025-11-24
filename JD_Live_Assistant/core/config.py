@@ -18,6 +18,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "profile_root": "",
         "port_profiles": {},
     },
+    "materials": {
+        "directory": "",
+    },
     "schedule": {
         "daily_start_time": "09:00",
     },

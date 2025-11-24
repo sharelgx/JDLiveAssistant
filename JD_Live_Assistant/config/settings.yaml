@@ -6,6 +6,8 @@ browser:
   profile_root: C:\Users\Administrator\AppData\Local\JDLiveAssistant\ChromeProfiles
   port_profiles:
     '1': C:\Users\Administrator\AppData\Local\JDLiveAssistant\ChromeProfiles\1
+materials:
+  directory: ''
 schedule:
   daily_start_time: 09:00
 hotkeys:
@@ -15,3 +17,5 @@ hotkeys:
 task:
   duration_seconds: 8
   interval_seconds: 2
+materials:
+  directory: D:\卡点讲解\1
